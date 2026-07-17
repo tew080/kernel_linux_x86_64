@@ -3882,9 +3882,8 @@ static inline void update_curr(struct rq *rq, struct task_struct *p)
  */
 unsigned long long task_sched_runtime(struct task_struct *p)
 {
-	unsigned long flags;
+	struct rq_flags rf;
 	struct rq *rq;
-	raw_spinlock_t *lock;
 	u64 ns;
 
 #ifdef CONFIG_64BIT
@@ -3903,7 +3902,7 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 		return tsk_seruntime(p);
 #endif
 
-	rq = task_access_lock_irqsave(p, &lock, &flags);
+	rq = task_rq_lock(p, &rf);
 	/*
 	 * Must be ->curr _and_ ->on_rq.  If dequeued, we would
 	 * project cycles that may never be accounted to this
@@ -3914,7 +3913,7 @@ unsigned long long task_sched_runtime(struct task_struct *p)
 		update_curr(rq, p);
 	}
 	ns = tsk_seruntime(p);
-	task_access_unlock_irqrestore(p, lock, &flags);
+	task_rq_unlock(rq, p, &rf);
 
 	return ns;
 }
