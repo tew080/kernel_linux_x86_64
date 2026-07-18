@@ -77,6 +77,7 @@ void get_avenrun(unsigned long *loads, unsigned long offset, int shift)
 	loads[2] = (avenrun[2] + offset) << shift;
 }
 
+#ifndef CONFIG_SCHED_ALT
 long calc_load_fold_active(struct rq *this_rq, long adjust)
 {
 	long nr_active, delta = 0;
@@ -91,6 +92,7 @@ long calc_load_fold_active(struct rq *this_rq, long adjust)
 
 	return delta;
 }
+#endif
 
 /**
  * fixed_power_int - compute: x^n, in O(log n) time
@@ -161,7 +163,7 @@ calc_load_n(unsigned long load, unsigned long exp,
 	return calc_load(load, fixed_power_int(exp, FSHIFT, n), active);
 }
 
-#ifdef CONFIG_NO_HZ_COMMON
+#if defined(CONFIG_NO_HZ_COMMON) && !defined(CONFIG_SCHED_ALT)
 /*
  * Handle NO_HZ for the global load-average.
  *
@@ -351,12 +353,19 @@ static inline void calc_global_nohz(void) { }
 void calc_global_load(void)
 {
 	unsigned long sample_window;
+#ifdef CONFIG_SCHED_BMQ
+	long active;
+#else
 	long active, delta;
+#endif
 
 	sample_window = READ_ONCE(calc_load_update);
 	if (time_before(jiffies, sample_window + 10))
 		return;
 
+#ifdef CONFIG_SCHED_BMQ
+	active = nr_running() + nr_uninterruptible();
+#else
 	/*
 	 * Fold the 'old' NO_HZ-delta to include all NO_HZ CPUs.
 	 */
@@ -365,6 +374,7 @@ void calc_global_load(void)
 		atomic_long_add(delta, &calc_load_tasks);
 
 	active = atomic_long_read(&calc_load_tasks);
+#endif
 	active = active > 0 ? active * FIXED_1 : 0;
 
 	avenrun[0] = calc_load(avenrun[0], EXP_1, active);
@@ -380,6 +390,7 @@ void calc_global_load(void)
 	calc_global_nohz();
 }
 
+#ifndef CONFIG_SCHED_ALT
 /*
  * Called from sched_tick() to periodically update this CPU's
  * active count.
@@ -397,3 +408,4 @@ void calc_global_load_tick(struct rq *this_rq)
 
 	this_rq->calc_load_update += LOAD_FREQ;
 }
+#endif
