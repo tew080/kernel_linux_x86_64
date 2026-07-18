@@ -1160,7 +1160,7 @@ CONFIG_BLK_MQ_STACKING=y
 # IO Schedulers
 #
 CONFIG_MQ_IOSCHED_DEADLINE=m
-CONFIG_MQ_IOSCHED_KYBER=y
+CONFIG_MQ_IOSCHED_KYBER=m
 CONFIG_IOSCHED_BFQ=m
 CONFIG_BFQ_GROUP_IOSCHED=y
 # CONFIG_BFQ_CGROUP_DEBUG is not set
@@ -13386,3 +13386,12 @@ CONFIG_RV_MON_STALL=n
 CONFIG_RV_MON_DEADLINE=n
 CONFIG_TRACE_REMOTE_TEST=n
 CONFIG_TEST_WORKQUEUE=n
+
+#################################################
+# Custom Lamud 71v1
+#################################################
+#################################################
+# ADIOS (Adaptive Deadline I/O scheduler)
+#################################################
+CONFIG_MQ_IOSCHED_ADIOS=y
+CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y
