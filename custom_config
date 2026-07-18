@@ -3,7 +3,8 @@
 # Linux/x86 7.0.12 Kernel Configuration
 #
 CONFIG_CC_VERSION_TEXT="x86_64-linux-gnu-gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0"
-CONFIG_CC_IS_GCC=y
+# CONFIG_CC_IS_GCC is not set
+CONFIG_CC_IS_CLANG=y
 CONFIG_GCC_VERSION=150200
 CONFIG_CLANG_VERSION=0
 CONFIG_AS_IS_GNU=y
@@ -13407,3 +13408,9 @@ CONFIG_SCHED_BMQ=y
 CONFIG_ANON_MIN_RATIO=1
 CONFIG_CLEAN_LOW_RATIO=15
 CONFIG_CLEAN_MIN_RATIO=4
+#################################################
+# Clang Options
+#################################################
+CONFIG_LTO_CLANG=y
+CONFIG_LTO_CLANG_THIN=y
+CONFIG_POLLY_CLANG=y
