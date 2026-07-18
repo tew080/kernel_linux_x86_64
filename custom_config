@@ -13395,3 +13395,15 @@ CONFIG_TEST_WORKQUEUE=n
 #################################################
 CONFIG_MQ_IOSCHED_ADIOS=y
 CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=y
+#################################################
+# PRJC
+#################################################
+CONFIG_SCHED_PROXY_EXEC=n
+CONFIG_SCHED_ALT=y
+CONFIG_SCHED_BMQ=y
+#################################################
+# le9uo
+#################################################
+CONFIG_ANON_MIN_RATIO=1
+CONFIG_CLEAN_LOW_RATIO=15
+CONFIG_CLEAN_MIN_RATIO=4
