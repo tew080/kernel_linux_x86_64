@@ -281,10 +281,17 @@ static struct lock_class_key af_elock_keys[AF_MAX];
 static struct lock_class_key af_kern_callback_keys[AF_MAX];
 
 /* Run time adjustable parameters. */
+#ifdef CONFIG_TWEAKS
+__u32 sysctl_wmem_max __read_mostly = 16 << 20; 
+EXPORT_SYMBOL(sysctl_wmem_max);
+__u32 sysctl_rmem_max __read_mostly = 16 << 20; 
+EXPORT_SYMBOL(sysctl_rmem_max);
+#else
 __u32 sysctl_wmem_max __read_mostly = 4 << 20;
 EXPORT_SYMBOL(sysctl_wmem_max);
 __u32 sysctl_rmem_max __read_mostly = 4 << 20;
 EXPORT_SYMBOL(sysctl_rmem_max);
+#endif
 __u32 sysctl_wmem_default __read_mostly = SK_WMEM_DEFAULT;
 __u32 sysctl_rmem_default __read_mostly = SK_RMEM_DEFAULT;
 

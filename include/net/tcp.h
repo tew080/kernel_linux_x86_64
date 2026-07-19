@@ -269,7 +269,12 @@ static_assert((1 << ATO_BITS) > TCP_DELACK_MAX);
 #define TCP_INIT_CWND		10
 
 /* Bit Flags for sysctl_tcp_fastopen */
+#ifdef CONFIG_TWEAKS
+#define	TFO_CLIENT_ENABLE	3
+#else
 #define	TFO_CLIENT_ENABLE	1
+#endif
+
 #define	TFO_SERVER_ENABLE	2
 #define	TFO_CLIENT_NO_COOKIE	4	/* Data in SYN w/o cookie option */
 

@@ -52,7 +52,11 @@ static u32 icmp_errors_extension_mask_all =
 	GENMASK_U8(ICMP_ERR_EXT_COUNT - 1, 0);
 
 /* obsolete */
+#ifdef CONFIG_TWEAKS
+static int sysctl_tcp_low_latency __read_mostly = 1;
+#else
 static int sysctl_tcp_low_latency __read_mostly;
+#endif
 
 /* Update system visible IP port range */
 static void set_local_port_range(struct net *net, unsigned int low, unsigned int high)

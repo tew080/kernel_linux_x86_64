@@ -729,7 +729,11 @@ void elv_update_nr_hw_queues(struct request_queue *q,
 void elevator_set_default(struct request_queue *q)
 {
 	struct elv_change_ctx ctx = {
+#if defined(CONFIG_TWEAKS) && defined(CONFIG_MQ_IOSCHED_KYBER)
+		.name = "kyber",
+#else
 		.name = "mq-deadline",
+#endif
 		.no_uevent = true,
 	};
 	int err;
