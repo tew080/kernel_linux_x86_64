@@ -57,12 +57,15 @@ fi
 
 tool="/usr"
 
+mkdir -p ~/tmp_build
+export TMPDIR=~/tmp_build
+
 #export LLVM=1
 #export LLVM_IAS=1
-export CC=/usr/bin/gcc-13
-export CXX=/usr/bin/g++-13
-export HOSTCC=/usr/bin/gcc-13
-export HOSTCXX=/usr/bin/g++-13
+export CC=/usr/bin/gcc-15
+export CXX=/usr/bin/g++-15
+export HOSTCC=/usr/bin/gcc-15
+export HOSTCXX=/usr/bin/g++-15
 export LD=/usr/bin/ld
 export AR=/usr/bin/ar
 export NM=/usr/bin/nm
@@ -72,7 +75,7 @@ export OBJDUMP=/usr/bin/objdump
 export READELF=/usr/bin/readelf
 export HOSTAR=/usr/bin/ar
 export HOSTLD=/usr/bin/ld
-
+#
 export PATH=$tool/bin:$PATH
 #export CFLAGS=--target=x86_64-linux-gnu
 #export CXXFLAGS=--target=x86_64-linux-gnu
@@ -113,10 +116,39 @@ gcc="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
     KCONFIG_OVERWRITECONFIG=1 \
     bindeb-pkg "
 
+ACTIVE_BUILD=$gcc
+
+# ==========================================
+# 5. ฟังก์ชันตรวจสอบการทำงาน
+# ==========================================
+check_compiler() {
+    echo "----------------------------------------------------"
+    if [[ "$ACTIVE_BUILD" == *"LLVM=1"* ]]; then
+        echo "[INFO] โหมดคอมไพล์: CLANG / LLVM"
+        if command -v clang &> /dev/null; then
+            echo "[INFO] เวอร์ชันที่ใช้: $(clang --version | head -n 1)"
+        else
+            echo "[ERROR] ไม่พบคำสั่ง clang ในระบบ!"
+        fi
+    else
+        echo "[INFO] โหมดคอมไพล์: GCC"
+        echo "[INFO] ตัวแปร CC ที่ตั้งไว้: $CC"
+        if command -v $CC &> /dev/null; then
+            echo "[INFO] เวอร์ชันที่ใช้: $($CC --version | head -n 1)"
+        else
+            echo "[ERROR] ไม่พบคำสั่ง $CC ในระบบ!"
+        fi
+    fi
+    echo "----------------------------------------------------"
+}
+
+# เรียกใช้งานฟังก์ชันตรวจสอบก่อนเริ่ม make
+check_compiler
+
 make -j$(nproc) modules
 
 #make -j$(nproc) $gcc INSTALL_MOD_PATH=modules INSTALL_MOD_STRIP=1 modules_install
 
-make -j$(nproc) $gcc INSTALL_MOD_PATH=modules INSTALL_MOD_STRIP=1
+make -j$(nproc) $gcc INSTALL_MOD_STRIP=1
 
 echo "[✅]"
