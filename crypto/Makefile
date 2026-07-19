@@ -3,6 +3,8 @@
 # Cryptographic API
 #
 
+subdir-ccflags-y += -fipa-pta -fgraphite-identity -floop-nest-optimize -fno-semantic-interposition
+
 CONTEXT_ANALYSIS := y
 
 obj-$(CONFIG_CRYPTO) += crypto.o

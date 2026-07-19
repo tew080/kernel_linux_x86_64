@@ -6,6 +6,8 @@
 # Rewritten to use lists instead of if-statements.
 #
 
+subdir-ccflags-y += -fipa-pta -fgraphite-identity -floop-nest-optimize -fno-semantic-interposition
+
 obj-y				:= devres.o socket.o core/
 
 obj-$(CONFIG_COMPAT)		+= compat.o

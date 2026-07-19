@@ -3,6 +3,8 @@
 # Makefile for some libs needed in the kernel.
 #
 
+subdir-ccflags-y += -fipa-pta -fgraphite-identity -floop-nest-optimize -fno-semantic-interposition
+
 ccflags-remove-$(CONFIG_FUNCTION_TRACER) += $(CC_FLAGS_FTRACE)
 
 # Branch profiling isn't noinstr-safe
