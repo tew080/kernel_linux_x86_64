@@ -13424,3 +13424,6 @@ CONFIG_POLLY_CLANG=n
 # Tweaks
 #################################################
 CONFIG_TWEAKS=y
+
+CONFIG_SCHED_CAMBYSES=y
+CONFIG_SCHED_CAMBYSES_SIMD=y
