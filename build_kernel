@@ -37,6 +37,8 @@
 
 #cat /sys/devices/system/cpu/cpuidle/current_driver
 
+#sudo apt purge nvidia-dkms-580-open nvidia-driver-580-open -y
+#sudo apt autoremove -y
 #sudo apt install nvidia-driver-575
 #sudo dkms remove nvidia/575.57.08 --all
 #sudo apt remove --purge nvidia-dkms-*
