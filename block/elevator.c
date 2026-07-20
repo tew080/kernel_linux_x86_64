@@ -745,11 +745,13 @@ void elevator_set_default(struct request_queue *q)
 		return;
 
 #ifdef CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-	ctx.name = "adios";
+    ctx.name = "adios";
+#elif defined(CONFIG_TWEAKS) && defined(CONFIG_MQ_IOSCHED_KYBER)
+    ctx.name = "kyber";
 #else // !CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
-	bool is_sq = q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags);
-	if (!is_sq)
-		return;
+    bool is_sq = q->nr_hw_queues == 1 || blk_mq_is_shared_tags(q->tag_set->flags);
+    if (!is_sq)
+        return;
 #endif // CONFIG_MQ_IOSCHED_DEFAULT_ADIOS
 
 	/*
