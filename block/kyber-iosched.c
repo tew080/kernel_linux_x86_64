@@ -125,12 +125,31 @@ static const char *kyber_latency_type_names[] = {
 	[KYBER_IO_LATENCY] = "I/O",
 };
 
+#ifdef CONFIG_TWEAKS
+enum {
+	/*
+	 * Sample แค่ 1 ใน (KYBER_TIMER_SAMPLE_MASK+1) ครั้งต่อ CPU ก่อนแตะ
+	 * kqd->timer ซึ่งเป็น cacheline ที่ทุก CPU แชร์กัน — ลด cross-CPU
+	 * contention บนเครื่อง NVMe ที่มี IOPS สูงและหลาย core
+	 */
+	KYBER_TIMER_SAMPLE_MASK = 63,
+};
+#endif
+
 /*
  * Per-cpu latency histograms: total latency and I/O latency for each scheduling
  * domain except for KYBER_OTHER.
  */
 struct kyber_cpu_latency {
 	atomic_t buckets[KYBER_OTHER][2][KYBER_LATENCY_BUCKETS];
+		/*
+	 * ตัวนับ per-CPU ธรรมดา (ไม่ต้อง atomic) เพราะถูกแตะภายใต้
+	 * get_cpu_ptr()/put_cpu_ptr() ที่ปิด preemption อยู่แล้วใน
+	 * kyber_completed_request()
+	 */
+#ifdef CONFIG_TWEAKS
+	u32 completions;
+#endif
 };
 
 /*
@@ -256,6 +275,39 @@ static int calculate_percentile(struct kyber_queue_data *kqd,
 	return bucket;
 }
 
+#ifdef CONFIG_TWEAKS
+static void kyber_resize_domain(struct kyber_queue_data *kqd,
+				unsigned int sched_domain, unsigned int depth)
+{
+	unsigned int orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+
+	depth = clamp(depth, 1U, kyber_depth[sched_domain]);
+
+	/*
+	 * sbitmap_queue_resize() มีต้นทุนไม่เล็ก และ p99 latency ของ NVMe
+	 * มี noise ตามธรรมชาติ (queueing, GC ของ SSD) ถ้าไม่กันไว้จะ resize
+	 * รัว ๆ ทุก timer window โดยไม่ได้ประโยชน์จริง (oscillation)
+	 *
+	 * ทิศทาง "ลด depth" (congestion จริง) ยังคงตอบสนองทันทีเสมอ —
+	 * ทิศทาง "เพิ่ม depth" (ผ่อนคลาย) ต้องเปลี่ยนแปลงมากกว่า ~6%
+	 * ของ depth เดิมก่อนจึง resize จริง ลดความถี่ resize ที่ไม่จำเป็น
+	 * โดยไม่ทำให้การป้องกัน congestion ช้าลง
+	 */
+	if (depth > orig_depth) {
+		unsigned int min_delta = max(orig_depth >> 4, 1U);
+
+		if (depth - orig_depth < min_delta &&
+		    depth < kyber_depth[sched_domain])
+			return;
+	}
+
+	if (depth != orig_depth) {
+		sbitmap_queue_resize(&kqd->domain_tokens[sched_domain], depth);
+		trace_kyber_adjust(kqd->dev, kyber_domain_names[sched_domain],
+				   depth);
+	}
+}
+#else
 static void kyber_resize_domain(struct kyber_queue_data *kqd,
 				unsigned int sched_domain, unsigned int depth)
 {
@@ -266,7 +318,103 @@ static void kyber_resize_domain(struct kyber_queue_data *kqd,
 				   depth);
 	}
 }
+#endif
 
+#ifdef CONFIG_TWEAKS
+static void kyber_timer_fn(struct timer_list *t)
+{
+	struct kyber_queue_data *kqd = timer_container_of(kqd, t, timer);
+	unsigned int sched_domain;
+	int cpu;
+	/* แยกแยะสถานะความหน่วงจริงเป็นรายโดเมน */
+	bool domain_bad[KYBER_OTHER] = {false};
+
+	/* Sum all of the per-cpu latency histograms. */
+	for_each_online_cpu(cpu) {
+		struct kyber_cpu_latency *cpu_latency;
+
+		cpu_latency = per_cpu_ptr(kqd->cpu_latency, cpu);
+		for (sched_domain = 0; sched_domain < KYBER_OTHER; sched_domain++) {
+			flush_latency_buckets(kqd, cpu_latency, sched_domain,
+					      KYBER_TOTAL_LATENCY);
+			flush_latency_buckets(kqd, cpu_latency, sched_domain,
+					      KYBER_IO_LATENCY);
+		}
+	}
+
+	/* [CRITICAL FIX] คำนวณค่าความกดดัน p90 เพื่ออัปเดตสถานะคอขวดในแต่ละโดเมน */
+	for (sched_domain = 0; sched_domain < KYBER_OTHER; sched_domain++) {
+		int p90;
+
+		p90 = calculate_percentile(kqd, sched_domain, KYBER_IO_LATENCY, 90);
+		if (p90 >= KYBER_GOOD_BUCKETS)
+			domain_bad[sched_domain] = true;
+	}
+
+	/* [SMART LOGIC] ตรวจสอบล่วงหน้าว่า ณ เวลานี้มี I/O ฝั่ง READ กำลังทำงานอยู่หรือไม่ */
+	int p99_read = calculate_percentile(kqd, KYBER_READ, KYBER_TOTAL_LATENCY, 99);
+
+	/* Adjust the scheduling domain depths. */
+	for (sched_domain = 0; sched_domain < KYBER_OTHER; sched_domain++) {
+		unsigned int orig_depth, depth;
+		int p99;
+		bool throttle;
+		/* ตั้งต้นเพดานคิวจากค่าคงที่ฮาร์ดแวร์ */
+		unsigned int max_depth = kyber_depth[sched_domain];
+
+		/* ดึงค่าความหน่วงมาคำนวณ (รีไซเคิลค่า p99_read เพื่อประหยัด CPU) */
+		if (sched_domain == KYBER_READ)
+			p99 = p99_read;
+		else
+			p99 = calculate_percentile(kqd, sched_domain, KYBER_TOTAL_LATENCY, 99);
+
+		/* โลจิกควบคุมความกดดันแบบอิงประสิทธิภาพฮาร์ดแวร์จริง */
+		if (sched_domain == KYBER_READ) {
+			throttle = domain_bad[KYBER_READ];
+		} else {
+			throttle = domain_bad[sched_domain] || domain_bad[KYBER_READ];
+
+			if (domain_bad[KYBER_READ])
+				max_depth = max(kyber_depth[sched_domain] >> 1, 1U);
+		}
+
+		if (throttle) {
+			if (p99 < 0)
+				p99 = kqd->domain_p99[sched_domain];
+			kqd->domain_p99[sched_domain] = -1;
+		} else if (p99 >= 0) {
+			kqd->domain_p99[sched_domain] = p99;
+		}
+		if (p99 < 0)
+			continue;
+
+		/* ช่วงบีบคิวลงเมื่อเกิดความหน่วงสูง (Scale Down) */
+		if (throttle || p99 >= KYBER_GOOD_BUCKETS) {
+			orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+			depth = (orig_depth * (p99 + 1)) >> KYBER_LATENCY_SHIFT;
+			
+			/* บังคับควบคุมไม่ให้คิวบวมเกินเพดานอัจฉริยะปัจจุบัน */
+			if (depth > max_depth)
+				depth = max_depth;
+				
+			kyber_resize_domain(kqd, sched_domain, depth);
+		} 
+		/* ช่วงคืนขนาดคิวเมื่อระบบโล่ง (Scale Up) */
+		else {
+			orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+			if (orig_depth < max_depth) {
+				unsigned int step = max(orig_depth >> 4, 1U);
+				kyber_resize_domain(kqd, sched_domain,
+						    min(orig_depth + step, max_depth));
+			}
+			/* กรณีที่เพดานหดตัวลงอย่างกะทันหันจากสภาวะ Mixed โหลด ให้ปรับระดับลงมาที่เพดานใหม่ทันที */
+			else if (orig_depth > max_depth) {
+				kyber_resize_domain(kqd, sched_domain, max_depth);
+			}
+		}
+	}
+}
+#else
 static void kyber_timer_fn(struct timer_list *t)
 {
 	struct kyber_queue_data *kqd = timer_container_of(kqd, t, timer);
@@ -346,6 +494,7 @@ static void kyber_timer_fn(struct timer_list *t)
 		}
 	}
 }
+#endif
 
 static struct kyber_queue_data *kyber_queue_data_alloc(struct request_queue *q)
 {
@@ -622,6 +771,41 @@ static void add_latency_sample(struct kyber_cpu_latency *cpu_latency,
 	atomic_inc(&cpu_latency->buckets[sched_domain][type][bucket]);
 }
 
+#ifdef CONFIG_TWEAKS
+static void kyber_completed_request(struct request *rq, u64 now)
+{
+	struct kyber_queue_data *kqd = rq->q->elevator->elevator_data;
+	struct kyber_cpu_latency *cpu_latency;
+	unsigned int sched_domain;
+	u64 target;
+	bool sample_timer;
+
+	sched_domain = kyber_sched_domain(rq->cmd_flags);
+	if (sched_domain == KYBER_OTHER)
+		return;
+
+	cpu_latency = get_cpu_ptr(kqd->cpu_latency);
+	target = kqd->latency_targets[sched_domain];
+	add_latency_sample(cpu_latency, sched_domain, KYBER_TOTAL_LATENCY,
+			   target, now - rq->start_time_ns);
+	add_latency_sample(cpu_latency, sched_domain, KYBER_IO_LATENCY, target,
+			   now - rq->io_start_time_ns);
+
+	/*
+	 * แตะ kqd->timer (shared cacheline) เฉพาะทุก N completion ต่อ CPU
+	 * แทนทุกครั้ง — calculate_percentile() ต้องรอสะสม 500 samples หรือ
+	 * 1 วินาทีอยู่แล้ว ดังนั้นการหน่วง "เช็คว่าต้อง rearm timer หรือไม่"
+	 * ไปสูงสุด 64 completions ไม่กระทบความไวในการตอบสนอง congestion
+	 * แต่ลด cross-CPU cacheline traffic ได้มากบน many-core NVMe
+	 */
+	sample_timer = (++cpu_latency->completions &
+			KYBER_TIMER_SAMPLE_MASK) == 0;
+	put_cpu_ptr(kqd->cpu_latency);
+
+	if (sample_timer || !timer_pending(&kqd->timer))
+		timer_reduce(&kqd->timer, jiffies + HZ / 10);
+}
+#else
 static void kyber_completed_request(struct request *rq, u64 now)
 {
 	struct kyber_queue_data *kqd = rq->q->elevator->elevator_data;
@@ -643,6 +827,7 @@ static void kyber_completed_request(struct request *rq, u64 now)
 
 	timer_reduce(&kqd->timer, jiffies + HZ / 10);
 }
+#endif
 
 struct flush_kcq_data {
 	struct kyber_hctx_data *khd;
