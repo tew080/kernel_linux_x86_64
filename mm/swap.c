@@ -1128,7 +1128,7 @@ static const struct ctl_table swap_sysctl_table[] = {
 		.procname	= "page-cluster",
 		.data		= &page_cluster,
 		.maxlen		= sizeof(int),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= (void *)&page_cluster_max,
@@ -1141,17 +1141,9 @@ int page_cluster __read_mostly = 3;
 static int page_cluster_baseline __read_mostly = 3;
 
 /*
- * ติดตามว่า admin ตั้งค่าเองผ่าน sysctl หรือไม่ (ข้อ 1)
- * true  = เคารพค่าที่ admin ตั้ง, dynamic adjust จะไม่ auto-restore ทับ
- * false = ค่าปัจจุบันเป็นของระบบเอง ปรับตาม pressure ได้เต็มที่
- */
-static atomic_t page_cluster_user_override = ATOMIC_INIT(0);
-
-/*
  * เก็บ "pressure level ที่ active อยู่ ณ ปัจจุบัน" แทนการ throttle ด้วยเวลาอย่างเดียว (ข้อ 2)
  * กติกา: level ที่สูงกว่าหรือเท่ากับ ตัวที่ active อยู่ เขียนทับได้เสมอ (ไม่ถูก throttle บัง)
  *        level ที่ต่ำกว่า ต้องรอ interval ผ่านไปก่อน ถึงจะ "ผ่อนคลาย" ลงได้
- * ผลคือ: สัญญาณวิกฤต (2) ไม่มีทางถูกดรอปโดย throttle ของสัญญาณที่เบากว่า
  */
 static atomic_t page_cluster_active_level = ATOMIC_INIT(0);
 static atomic_long_t swap_cluster_last_relax_jif = ATOMIC_LONG_INIT(0);
@@ -1180,30 +1172,21 @@ static int __init compute_baseline_cluster(unsigned long megs)
 }
 
 /*
- * swap_cluster_notify_user_set - เรียกจาก sysctl proc handler ตอน admin
- * เขียนค่าเองผ่าน /proc/sys/vm/page-cluster
- *
- * ทำเครื่องหมายว่านับจากนี้ dynamic adjust จะไม่ auto-restore ค่ากลับ baseline
- * ให้ (เคารพเจตนาผู้ดูแลระบบ) ยกเว้นกรณีวิกฤตจริง (level 2) ซึ่งยัง override
- * ได้เพื่อความปลอดภัยของระบบ (คล้าย min_free_kbytes ที่มี hard floor)
- */
-void swap_cluster_notify_user_set(void)
-{
-	atomic_set(&page_cluster_user_override, 1);
-}
-
-/*
  * swap_cluster_adjust - ปรับ page_cluster ตาม pressure level
  * @pressure_level: 0 ปกติ, 1 ตึง, 2 วิกฤต
  *
- * Guarantee: level ที่สูงกว่า/เท่ากับสถานะ active ปัจจุบัน เขียนได้ทันที
- * ไม่มีทางถูก throttle บัง (แก้ข้อ 2) ส่วนการ "ผ่อนคลาย" ลง (level ต่ำกว่า
- * สถานะปัจจุบัน) ยังต้อง throttle ตาม interval เพื่อกัน flapping (ข้อ 5)
+ * [CHANGE] page_cluster ไม่รองรับการตั้งค่าเองผ่าน sysctl อีกต่อไป —
+ * ฟังก์ชันนี้เป็นเจ้าของค่านี้แต่เพียงผู้เดียว ทุก level ปรับตาม
+ * baseline/tiers ที่คำนวณจาก RAM เท่านั้น ไม่มี branch สำหรับ
+ * "เคารพค่า admin" หลงเหลืออยู่ — ตัด user_override/user_value ออกทั้งคู่
+ *
+ * Guarantee เดิมยังอยู่: level ที่สูงกว่า/เท่ากับสถานะ active ปัจจุบัน
+ * เขียนได้ทันที ไม่ถูก throttle บัง ส่วนการผ่อนคลายลงยัง throttle ตาม
+ * interval เพื่อกัน flapping
  */
 void swap_cluster_adjust(int pressure_level)
 {
 	int cur_active, new_cluster, cur_val;
-	bool user_set;
 
 	if (unlikely(pressure_level < 0 || pressure_level > 2))
 		return;
@@ -1211,7 +1194,6 @@ void swap_cluster_adjust(int pressure_level)
 	cur_active = atomic_read(&page_cluster_active_level);
 
 	if (pressure_level < cur_active) {
-		/* กำลังจะผ่อนคลายลง: throttle กันเด้งถี่ (ข้อ 5) */
 		unsigned long now = jiffies;
 		unsigned long last = atomic_long_read(&swap_cluster_last_relax_jif);
 
@@ -1221,25 +1203,17 @@ void swap_cluster_adjust(int pressure_level)
 					 last, now) != last)
 			return;
 	}
-	/* pressure_level >= cur_active: สัญญาณเท่าเดิมหรือรุนแรงขึ้น -> ไปต่อทันที ไม่ throttle */
 
 	atomic_set(&page_cluster_active_level, pressure_level);
 
-	user_set = atomic_read(&page_cluster_user_override);
-
 	switch (pressure_level) {
 	case 2:
-		/* วิกฤต: บังคับ override เสมอเพื่อความปลอดภัยของระบบ ไม่ว่า admin ตั้งไว้ยังไง */
 		new_cluster = 0;
 		break;
 	case 1:
-		if (user_set)
-			return;   /* เคารพค่า admin ในสถานะไม่วิกฤต (แก้ข้อ 1) */
 		new_cluster = max(page_cluster_baseline - 2, 1);
 		break;
 	default: /* level 0: กลับปกติ */
-		if (user_set)
-			return;   /* ไม่ auto-restore ทับค่า admin (แก้ข้อ 1) */
 		new_cluster = page_cluster_baseline;
 		break;
 	}
