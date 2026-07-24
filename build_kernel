@@ -47,6 +47,8 @@
 #sudo rm -rf /etc/modules-load.d/nvidia*
 #sudo rm -rf /var/lib/dkms/nvidia*
 #sudo apt autoclean
+#sudo apt purge '^nvidia-.*'
+#sudo apt autoremove
 
 #sudo ubuntu-drivers devices
 #sudo ubuntu-drivers autoinstall
@@ -64,10 +66,10 @@ export TMPDIR=~/tmp_build
 
 #export LLVM=1
 #export LLVM_IAS=1
-export CC=/usr/bin/gcc-15
-export CXX=/usr/bin/g++-15
-export HOSTCC=/usr/bin/gcc-15
-export HOSTCXX=/usr/bin/g++-15
+export CC=/usr/bin/gcc-13
+export CXX=/usr/bin/g++-13
+export HOSTCC=/usr/bin/gcc-13
+export HOSTCXX=/usr/bin/g++-13
 export LD=/usr/bin/ld
 export AR=/usr/bin/ar
 export NM=/usr/bin/nm
