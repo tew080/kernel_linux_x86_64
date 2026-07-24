@@ -359,16 +359,13 @@ static void kyber_timer_fn(struct timer_list *t)
 		unsigned int orig_depth, depth;
 		int p99;
 		bool throttle;
-		/* ตั้งต้นเพดานคิวจากค่าคงที่ฮาร์ดแวร์ */
 		unsigned int max_depth = kyber_depth[sched_domain];
 
-		/* ดึงค่าความหน่วงมาคำนวณ (รีไซเคิลค่า p99_read เพื่อประหยัด CPU) */
 		if (sched_domain == KYBER_READ)
 			p99 = p99_read;
 		else
 			p99 = calculate_percentile(kqd, sched_domain, KYBER_TOTAL_LATENCY, 99);
 
-		/* โลจิกควบคุมความกดดันแบบอิงประสิทธิภาพฮาร์ดแวร์จริง */
 		if (sched_domain == KYBER_READ) {
 			throttle = domain_bad[KYBER_READ];
 		} else {
@@ -377,6 +374,15 @@ static void kyber_timer_fn(struct timer_list *t)
 			if (domain_bad[KYBER_READ])
 				max_depth = max(kyber_depth[sched_domain] >> 1, 1U);
 		}
+
+		/*
+		 * [FIX] เพดานฉุกเฉินจาก READ ต้องมีผลทันที ไม่ขึ้นกับว่าโดเมนนี้
+		 * มี p99 sample พอหรือยัง มิฉะนั้น WRITE/DISCARD ที่ IOPS ต่ำ/burst-y
+		 * จะหลุดเพดานไปจนกว่าจะสะสม sample ครบ ทำให้ READ latency พังต่อ
+		 */
+		orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+		if (orig_depth > max_depth)
+			kyber_resize_domain(kqd, sched_domain, max_depth);
 
 		if (throttle) {
 			if (p99 < 0)
@@ -388,27 +394,38 @@ static void kyber_timer_fn(struct timer_list *t)
 		if (p99 < 0)
 			continue;
 
+		orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+
 		/* ช่วงบีบคิวลงเมื่อเกิดความหน่วงสูง (Scale Down) */
 		if (throttle || p99 >= KYBER_GOOD_BUCKETS) {
-			orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
 			depth = (orig_depth * (p99 + 1)) >> KYBER_LATENCY_SHIFT;
-			
-			/* บังคับควบคุมไม่ให้คิวบวมเกินเพดานอัจฉริยะปัจจุบัน */
+
 			if (depth > max_depth)
 				depth = max_depth;
-				
+
+			/*
+			 * [FIX] กัน WRITE/DISCARD ไม่ให้ถูกบีบจนหยุดสนิทตอน READ
+			 * กดดันต่อเนื่องยาวๆ (เช่นเล่นเกมพร้อม apt/npm install) —
+			 * ให้ยังมี throughput ขั้นต่ำคืบหน้าเสมอ ไม่ใช่หิวโหยเป็น 0
+			 * (READ เองไม่ใส่ floor เพราะเป็นโดเมน priority สูงสุด
+			 * ถ้ามันคับคั่งจริงต้องปล่อยให้บีบเต็มที่)
+			 */
+			if (sched_domain != KYBER_READ) {
+				unsigned int min_depth =
+					max(kyber_depth[sched_domain] >> 3, 1U);
+				if (depth < min_depth)
+					depth = min_depth;
+			}
+
 			kyber_resize_domain(kqd, sched_domain, depth);
-		} 
+		}
 		/* ช่วงคืนขนาดคิวเมื่อระบบโล่ง (Scale Up) */
 		else {
-			orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
 			if (orig_depth < max_depth) {
 				unsigned int step = max(orig_depth >> 4, 1U);
 				kyber_resize_domain(kqd, sched_domain,
 						    min(orig_depth + step, max_depth));
-			}
-			/* กรณีที่เพดานหดตัวลงอย่างกะทันหันจากสภาวะ Mixed โหลด ให้ปรับระดับลงมาที่เพดานใหม่ทันที */
-			else if (orig_depth > max_depth) {
+			} else if (orig_depth > max_depth) {
 				kyber_resize_domain(kqd, sched_domain, max_depth);
 			}
 		}
