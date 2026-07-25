@@ -42,7 +42,7 @@ CONFIG_THREAD_INFO_IN_TASK=y
 CONFIG_INIT_ENV_ARG_LIMIT=32
 # CONFIG_COMPILE_TEST is not set
 # CONFIG_WERROR is not set
-CONFIG_LOCALVERSION="-lamud-71v1"
+CONFIG_LOCALVERSION="-lamud-71v1x-alt+bmq+lsa3"
 # CONFIG_LOCALVERSION_AUTO is not set
 CONFIG_BUILD_SALT=""
 CONFIG_HAVE_KERNEL_GZIP=y
@@ -13408,6 +13408,7 @@ CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=n
 CONFIG_SCHED_PROXY_EXEC=n
 CONFIG_SCHED_ALT=y
 CONFIG_SCHED_BMQ=y
+CONFIG_SCHED_PDS=n
 #################################################
 # le9uo
 #################################################
