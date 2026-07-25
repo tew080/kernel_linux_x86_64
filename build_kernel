@@ -54,6 +54,12 @@
 #sudo ubuntu-drivers autoinstall
 #sudo apt install nvidia-driver-
 
+# ปิด systemd-oomd ที่ต้องใช้ PSI
+#sudo systemctl disable --now systemd-oomd
+# ติดตั้ง EarlyOOM หรือ Nohang แทน
+#sudo apt install earlyoom
+#sudo systemctl enable --now earlyoom
+
 if [[ $1 = "-c" || $1 = "--clean" ]]; then
 make clean
 make mrproper
