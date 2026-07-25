@@ -13425,12 +13425,6 @@ CONFIG_POLLY_CLANG=n
 #################################################
 CONFIG_TWEAKS=y
 #################################################
-# Cambyses scored migration selection for CFS load balancer
-#################################################
-CONFIG_SCHED_CAMBYSES=n
-CONFIG_SCHED_CAMBYSES_SIMD=n
-#################################################
 # x86-64 compiler ISA level
 #################################################
 CONFIG_X86_64_VERSION=3
-
