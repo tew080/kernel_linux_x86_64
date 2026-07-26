@@ -590,7 +590,7 @@ static struct ctl_table net_core_table[] = {
 #ifdef CONFIG_NET_SCHED
 	{
 		.procname	= "default_qdisc",
-		.mode		= 0644,
+		.mode		= 0444,
 		.maxlen		= IFNAMSIZ,
 		.proc_handler	= set_default_qdisc
 	},
