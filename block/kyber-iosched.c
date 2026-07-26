@@ -29,6 +29,7 @@
 enum {
 	KYBER_READ,
 	KYBER_WRITE,
+	KYBER_SWAP,      /* แยก pool ให้ swap-out โดยเฉพาะ */
 	KYBER_DISCARD,
 	KYBER_OTHER,
 	KYBER_NUM_DOMAINS,
@@ -37,6 +38,7 @@ enum {
 static const char *kyber_domain_names[] = {
 	[KYBER_READ] = "READ",
 	[KYBER_WRITE] = "WRITE",
+	[KYBER_SWAP] = "SWAP",
 	[KYBER_DISCARD] = "DISCARD",
 	[KYBER_OTHER] = "OTHER",
 };
@@ -60,6 +62,7 @@ static const unsigned int kyber_depth[] = {
 	[KYBER_READ] = 256,
 	[KYBER_WRITE] = 128,
 	[KYBER_DISCARD] = 64,
+	[KYBER_SWAP]    = 64,   
 	[KYBER_OTHER] = 16,
 };
 
@@ -69,6 +72,7 @@ static const unsigned int kyber_depth[] = {
 static const u64 kyber_latency_targets[] = {
 	[KYBER_READ] = 2ULL * NSEC_PER_MSEC,
 	[KYBER_WRITE] = 10ULL * NSEC_PER_MSEC,
+	[KYBER_SWAP]    = 20ULL * NSEC_PER_MSEC, /* เน้น throughput มากกว่า latency ต่อ req */
 	[KYBER_DISCARD] = 5ULL * NSEC_PER_SEC,
 };
 
@@ -79,6 +83,7 @@ static const u64 kyber_latency_targets[] = {
 static const unsigned int kyber_batch_size[] = {
 	[KYBER_READ] = 16,
 	[KYBER_WRITE] = 8,
+	[KYBER_SWAP]    = 4,
 	[KYBER_DISCARD] = 1,
 	[KYBER_OTHER] = 1,
 };
@@ -207,7 +212,13 @@ static unsigned int kyber_sched_domain(blk_opf_t opf)
 	case REQ_OP_READ:
 		return KYBER_READ;
 	case REQ_OP_WRITE:
-		return KYBER_WRITE;
+		/*
+		 * swap-out ถูก kernel tag REQ_SWAP ไว้แล้ว (mm/page_io.c)
+		 * แยกออกจาก WRITE ทั่วไป เพื่อไม่ให้ apt/npm install ที่หนัก
+		 * ไปดึง token ตัดหน้า swap-out ตอน RAM ใกล้เต็ม และไม่ให้
+		 * READ-priority throttle (ในไทม์เมอร์) บีบมันจนตามไม่ทัน
+		 */
+		return (opf & REQ_SWAP) ? KYBER_SWAP : KYBER_WRITE;
 	case REQ_OP_DISCARD:
 		return KYBER_DISCARD;
 	default:
@@ -350,9 +361,17 @@ static void kyber_timer_fn(struct timer_list *t)
 
 		if (sched_domain == KYBER_READ) {
 			throttle = domain_bad[KYBER_READ];
+		} else if (sched_domain == KYBER_SWAP) {
+			/*
+			 * ห้ามให้ SWAP ถูกบีบตาม READ — มันคือกลไก
+			 * relieve memory pressure เอง ถ้าบีบตาม READ latency
+			 * จะยิ่งทำให้ reclaim ตามไม่ทันแล้ว READ (page fault)
+			 * ยิ่งแย่ลงไปอีก (วงจรอุบาทว์) ปล่อยให้ self-throttle
+			 * จาก p99 ของตัวเองอย่างเดียวพอ เหมือน READ
+			 */
+			throttle = domain_bad[KYBER_SWAP];
 		} else {
 			throttle = domain_bad[sched_domain] || domain_bad[KYBER_READ];
-
 			if (domain_bad[KYBER_READ])
 				max_depth = max(kyber_depth[sched_domain] >> 1, 1U);
 		}
