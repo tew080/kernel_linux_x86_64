@@ -499,7 +499,7 @@ static inline void
 task_rq_unlock(struct rq *rq, struct task_struct *p, struct rq_flags *rf)
 	__releases(__rq_lockp(rq), &p->pi_lock)
 {
-	__task_rq_unlock(rq, p, rf);
+	__task_rq_unlock(rq, rf);
 	raw_spin_unlock_irqrestore(&p->pi_lock, rf->flags);
 }
 
@@ -513,7 +513,7 @@ DECLARE_LOCK_GUARD_1_ATTRS(task_rq_lock, __acquires(&_T->pi_lock),
 
 DEFINE_LOCK_GUARD_1(__task_rq_lock, struct task_struct,
 		    _T->rq = __task_rq_lock(_T->lock, &_T->rf),
-		    __task_rq_unlock(_T->rq, _T->lock, &_T->rf),
+		    __task_rq_unlock(_T->rq, &_T->rf),
 		    struct rq *rq; struct rq_flags rf)
 
 static inline void rq_lock_irqsave(struct rq *rq, struct rq_flags *rf)
@@ -596,45 +596,6 @@ static inline struct rq *_this_rq_lock_irq(struct rq_flags *rf) __acquires_ret
 	rq_lock(rq, rf);
 
 	return rq;
-}
-
-static inline raw_spinlock_t *__rq_lockp(struct rq *rq)
-{
-	return &rq->lock;
-}
-
-static inline raw_spinlock_t *rq_lockp(struct rq *rq)
-{
-	return __rq_lockp(rq);
-}
-
-static inline void lockdep_assert_rq_held(struct rq *rq)
-{
-	lockdep_assert_held(__rq_lockp(rq));
-}
-
-extern void raw_spin_rq_lock_nested(struct rq *rq, int subclass);
-
-static inline void raw_spin_rq_lock(struct rq *rq)
-{
-	raw_spin_rq_lock_nested(rq, 0);
-}
-
-static inline void raw_spin_rq_unlock(struct rq *rq)
-{
-	raw_spin_unlock(rq_lockp(rq));
-}
-
-static inline void raw_spin_rq_lock_irq(struct rq *rq)
-{
-	local_irq_disable();
-	raw_spin_rq_lock(rq);
-}
-
-static inline void raw_spin_rq_unlock_irq(struct rq *rq)
-{
-	raw_spin_rq_unlock(rq);
-	local_irq_enable();
 }
 
 extern struct static_key_false sched_schedstats;

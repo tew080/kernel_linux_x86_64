@@ -1147,7 +1147,7 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
 		 * if the runqueue has changed and p is actually now
 		 * running somewhere else!
 		 */
-		while (task_on_cpu(rq, p)) {
+		while (task_on_cpu(p)) {
 			if (!task_state_match(p, match_state))
 				return 0;
 			cpu_relax();
@@ -1160,7 +1160,7 @@ unsigned long wait_task_inactive(struct task_struct *p, unsigned int match_state
 		 */
 		rq = task_rq_lock(p, &rf);
 		trace_sched_wait_task(p);
-		running = task_on_cpu(rq, p);
+		running = task_on_cpu(p);
 		queued = task_on_rq_queued(p);
 		ncsw = 0;
 		if ((match = __task_state_match(p, match_state))) {
@@ -5110,7 +5110,7 @@ out_unlock:
 	/* Caller holds task_struct::pi_lock, IRQs are still disabled */
 
 	__balance_callbacks(rq, &rf);
-	__task_rq_unlock(rq, p, &rf);
+	__task_rq_unlock(rq, &rf);
 }
 #endif /* CONFIG_RT_MUTEXES */
 
