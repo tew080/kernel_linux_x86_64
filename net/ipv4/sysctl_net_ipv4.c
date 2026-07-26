@@ -982,7 +982,7 @@ static struct ctl_table ipv4_net_table[] = {
 	{
 		.procname	= "tcp_congestion_control",
 		.data		= &init_net.ipv4.tcp_congestion_control,
-		.mode		= 0644,
+		.mode		= 0444,
 		.maxlen		= TCP_CA_NAME_MAX,
 		.proc_handler	= proc_tcp_congestion_control,
 	},
