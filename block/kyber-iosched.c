@@ -120,6 +120,15 @@ enum {
 	KYBER_IO_LATENCY,
 };
 
+enum {
+	/*
+	 * Sample แค่ 1 ใน (KYBER_TIMER_SAMPLE_MASK+1) ครั้งต่อ CPU ก่อนแตะ
+	 * kqd->timer ซึ่งเป็น cacheline ที่ทุก CPU แชร์กัน — ลด cross-CPU
+	 * contention บนเครื่อง NVMe ที่มี IOPS สูงและหลาย core
+	 */
+	KYBER_TIMER_SAMPLE_MASK = 63,
+};
+
 static const char *kyber_latency_type_names[] = {
 	[KYBER_TOTAL_LATENCY] = "total",
 	[KYBER_IO_LATENCY] = "I/O",
@@ -131,6 +140,12 @@ static const char *kyber_latency_type_names[] = {
  */
 struct kyber_cpu_latency {
 	atomic_t buckets[KYBER_OTHER][2][KYBER_LATENCY_BUCKETS];
+	/*
+	 * ตัวนับ per-CPU ธรรมดา (ไม่ต้อง atomic) เพราะถูกแตะภายใต้
+	 * get_cpu_ptr()/put_cpu_ptr() ที่ปิด preemption อยู่แล้วใน
+	 * kyber_completed_request()
+	 */
+	u32 completions;
 };
 
 /*
@@ -259,8 +274,29 @@ static int calculate_percentile(struct kyber_queue_data *kqd,
 static void kyber_resize_domain(struct kyber_queue_data *kqd,
 				unsigned int sched_domain, unsigned int depth)
 {
+	unsigned int orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+
 	depth = clamp(depth, 1U, kyber_depth[sched_domain]);
-	if (depth != kqd->domain_tokens[sched_domain].sb.depth) {
+
+	/*
+	 * sbitmap_queue_resize() มีต้นทุนไม่เล็ก และ p99 latency ของ NVMe
+	 * มี noise ตามธรรมชาติ (queueing, GC ของ SSD) ถ้าไม่กันไว้จะ resize
+	 * รัว ๆ ทุก timer window โดยไม่ได้ประโยชน์จริง (oscillation)
+	 *
+	 * ทิศทาง "ลด depth" (congestion จริง) ยังคงตอบสนองทันทีเสมอ —
+	 * ทิศทาง "เพิ่ม depth" (ผ่อนคลาย) ต้องเปลี่ยนแปลงมากกว่า ~6%
+	 * ของ depth เดิมก่อนจึง resize จริง ลดความถี่ resize ที่ไม่จำเป็น
+	 * โดยไม่ทำให้การป้องกัน congestion ช้าลง
+	 */
+	if (depth > orig_depth) {
+		unsigned int min_delta = max(orig_depth >> 4, 1U);
+
+		if (depth - orig_depth < min_delta &&
+		    depth < kyber_depth[sched_domain])
+			return;
+	}
+
+	if (depth != orig_depth) {
 		sbitmap_queue_resize(&kqd->domain_tokens[sched_domain], depth);
 		trace_kyber_adjust(kqd->dev, kyber_domain_names[sched_domain],
 				   depth);
@@ -272,7 +308,8 @@ static void kyber_timer_fn(struct timer_list *t)
 	struct kyber_queue_data *kqd = timer_container_of(kqd, t, timer);
 	unsigned int sched_domain;
 	int cpu;
-	bool bad = false;
+	/* แยกแยะสถานะความหน่วงจริงเป็นรายโดเมน */
+	bool domain_bad[KYBER_OTHER] = {false};
 
 	/* Sum all of the per-cpu latency histograms. */
 	for_each_online_cpu(cpu) {
@@ -287,40 +324,49 @@ static void kyber_timer_fn(struct timer_list *t)
 		}
 	}
 
-	/*
-	 * Check if any domains have a high I/O latency, which might indicate
-	 * congestion in the device. Note that we use the p90; we don't want to
-	 * be too sensitive to outliers here.
-	 */
+	/* [CRITICAL FIX] คำนวณค่าความกดดัน p90 เพื่ออัปเดตสถานะคอขวดในแต่ละโดเมน */
 	for (sched_domain = 0; sched_domain < KYBER_OTHER; sched_domain++) {
 		int p90;
 
-		p90 = calculate_percentile(kqd, sched_domain, KYBER_IO_LATENCY,
-					   90);
+		p90 = calculate_percentile(kqd, sched_domain, KYBER_IO_LATENCY, 90);
 		if (p90 >= KYBER_GOOD_BUCKETS)
-			bad = true;
+			domain_bad[sched_domain] = true;
 	}
 
-	/*
-	 * Adjust the scheduling domain depths. If we determined that there was
-	 * congestion, we throttle all domains with good latencies. Either way,
-	 * we ease up on throttling domains with bad latencies.
-	 */
+	/* [SMART LOGIC] ตรวจสอบล่วงหน้าว่า ณ เวลานี้มี I/O ฝั่ง READ กำลังทำงานอยู่หรือไม่ */
+	int p99_read = calculate_percentile(kqd, KYBER_READ, KYBER_TOTAL_LATENCY, 99);
+
+	/* Adjust the scheduling domain depths. */
 	for (sched_domain = 0; sched_domain < KYBER_OTHER; sched_domain++) {
 		unsigned int orig_depth, depth;
 		int p99;
+		bool throttle;
+		unsigned int max_depth = kyber_depth[sched_domain];
 
-		p99 = calculate_percentile(kqd, sched_domain,
-					   KYBER_TOTAL_LATENCY, 99);
+		if (sched_domain == KYBER_READ)
+			p99 = p99_read;
+		else
+			p99 = calculate_percentile(kqd, sched_domain, KYBER_TOTAL_LATENCY, 99);
+
+		if (sched_domain == KYBER_READ) {
+			throttle = domain_bad[KYBER_READ];
+		} else {
+			throttle = domain_bad[sched_domain] || domain_bad[KYBER_READ];
+
+			if (domain_bad[KYBER_READ])
+				max_depth = max(kyber_depth[sched_domain] >> 1, 1U);
+		}
+
 		/*
-		 * This is kind of subtle: different domains will not
-		 * necessarily have enough samples to calculate the latency
-		 * percentiles during the same window, so we have to remember
-		 * the p99 for the next time we observe congestion; once we do,
-		 * we don't want to throttle again until we get more data, so we
-		 * reset it to -1.
+		 * [FIX] เพดานฉุกเฉินจาก READ ต้องมีผลทันที ไม่ขึ้นกับว่าโดเมนนี้
+		 * มี p99 sample พอหรือยัง มิฉะนั้น WRITE/DISCARD ที่ IOPS ต่ำ/burst-y
+		 * จะหลุดเพดานไปจนกว่าจะสะสม sample ครบ ทำให้ READ latency พังต่อ
 		 */
-		if (bad) {
+		orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+		if (orig_depth > max_depth)
+			kyber_resize_domain(kqd, sched_domain, max_depth);
+
+		if (throttle) {
 			if (p99 < 0)
 				p99 = kqd->domain_p99[sched_domain];
 			kqd->domain_p99[sched_domain] = -1;
@@ -330,19 +376,40 @@ static void kyber_timer_fn(struct timer_list *t)
 		if (p99 < 0)
 			continue;
 
-		/*
-		 * If this domain has bad latency, throttle less. Otherwise,
-		 * throttle more iff we determined that there is congestion.
-		 *
-		 * The new depth is scaled linearly with the p99 latency vs the
-		 * latency target. E.g., if the p99 is 3/4 of the target, then
-		 * we throttle down to 3/4 of the current depth, and if the p99
-		 * is 2x the target, then we double the depth.
-		 */
-		if (bad || p99 >= KYBER_GOOD_BUCKETS) {
-			orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+		orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
+
+		/* ช่วงบีบคิวลงเมื่อเกิดความหน่วงสูง (Scale Down) */
+		if (throttle || p99 >= KYBER_GOOD_BUCKETS) {
 			depth = (orig_depth * (p99 + 1)) >> KYBER_LATENCY_SHIFT;
+
+			if (depth > max_depth)
+				depth = max_depth;
+
+			/*
+			 * [FIX] กัน WRITE/DISCARD ไม่ให้ถูกบีบจนหยุดสนิทตอน READ
+			 * กดดันต่อเนื่องยาวๆ (เช่นเล่นเกมพร้อม apt/npm install) —
+			 * ให้ยังมี throughput ขั้นต่ำคืบหน้าเสมอ ไม่ใช่หิวโหยเป็น 0
+			 * (READ เองไม่ใส่ floor เพราะเป็นโดเมน priority สูงสุด
+			 * ถ้ามันคับคั่งจริงต้องปล่อยให้บีบเต็มที่)
+			 */
+			if (sched_domain != KYBER_READ) {
+				unsigned int min_depth =
+					max(kyber_depth[sched_domain] >> 3, 1U);
+				if (depth < min_depth)
+					depth = min_depth;
+			}
+
 			kyber_resize_domain(kqd, sched_domain, depth);
+		}
+		/* ช่วงคืนขนาดคิวเมื่อระบบโล่ง (Scale Up) */
+		else {
+			if (orig_depth < max_depth) {
+				unsigned int step = max(orig_depth >> 4, 1U);
+				kyber_resize_domain(kqd, sched_domain,
+						    min(orig_depth + step, max_depth));
+			} else if (orig_depth > max_depth) {
+				kyber_resize_domain(kqd, sched_domain, max_depth);
+			}
 		}
 	}
 }
@@ -628,6 +695,7 @@ static void kyber_completed_request(struct request *rq, u64 now)
 	struct kyber_cpu_latency *cpu_latency;
 	unsigned int sched_domain;
 	u64 target;
+	bool sample_timer;
 
 	sched_domain = kyber_sched_domain(rq->cmd_flags);
 	if (sched_domain == KYBER_OTHER)
@@ -639,9 +707,20 @@ static void kyber_completed_request(struct request *rq, u64 now)
 			   target, now - rq->start_time_ns);
 	add_latency_sample(cpu_latency, sched_domain, KYBER_IO_LATENCY, target,
 			   now - rq->io_start_time_ns);
+
+	/*
+	 * แตะ kqd->timer (shared cacheline) เฉพาะทุก N completion ต่อ CPU
+	 * แทนทุกครั้ง — calculate_percentile() ต้องรอสะสม 500 samples หรือ
+	 * 1 วินาทีอยู่แล้ว ดังนั้นการหน่วง "เช็คว่าต้อง rearm timer หรือไม่"
+	 * ไปสูงสุด 64 completions ไม่กระทบความไวในการตอบสนอง congestion
+	 * แต่ลด cross-CPU cacheline traffic ได้มากบน many-core NVMe
+	 */
+	sample_timer = (++cpu_latency->completions &
+			KYBER_TIMER_SAMPLE_MASK) == 0;
 	put_cpu_ptr(kqd->cpu_latency);
 
-	timer_reduce(&kqd->timer, jiffies + HZ / 10);
+	if (sample_timer || !timer_pending(&kqd->timer))
+		timer_reduce(&kqd->timer, jiffies + HZ / 10);
 }
 
 struct flush_kcq_data {
