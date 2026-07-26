@@ -1128,29 +1128,106 @@ static const struct ctl_table swap_sysctl_table[] = {
 		.procname	= "page-cluster",
 		.data		= &page_cluster,
 		.maxlen		= sizeof(int),
-		.mode		= 0644,
+		.mode		= 0444,
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= (void *)&page_cluster_max,
 	}
 };
 
+/* ค่าเริ่มต้น "ปลอดภัย" ป้องกันกรณีถูกเรียกก่อน swap_setup() */
+int page_cluster __read_mostly = 3;
+static int page_cluster_baseline __read_mostly = 3;
+
 /*
- * Perform any setup for the swap system
+ * เก็บ "pressure level ที่ active อยู่ ณ ปัจจุบัน" แทนการ throttle ด้วยเวลาอย่างเดียว (ข้อ 2)
+ * กติกา: level ที่สูงกว่าหรือเท่ากับ ตัวที่ active อยู่ เขียนทับได้เสมอ (ไม่ถูก throttle บัง)
+ *        level ที่ต่ำกว่า ต้องรอ interval ผ่านไปก่อน ถึงจะ "ผ่อนคลาย" ลงได้
  */
+static atomic_t page_cluster_active_level = ATOMIC_INIT(0);
+static atomic_long_t swap_cluster_last_relax_jif = ATOMIC_LONG_INIT(0);
+#define SWAP_CLUSTER_RELAX_INTERVAL   (HZ / 4)
+
+static const struct {
+	unsigned long min_megs;
+	int cluster;
+} swap_cluster_tiers[] = {
+	{ 2048,  6 },
+	{  512,  5 },
+	{  128,  4 },
+	{   16,  3 },
+	{    0,  2 },
+};
+
+static int __init compute_baseline_cluster(unsigned long megs)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(swap_cluster_tiers); i++) {
+		if (megs >= swap_cluster_tiers[i].min_megs)
+			return swap_cluster_tiers[i].cluster;
+	}
+	return 2;
+}
+
+/*
+ * swap_cluster_adjust - ปรับ page_cluster ตาม pressure level
+ * @pressure_level: 0 ปกติ, 1 ตึง, 2 วิกฤต
+ *
+ * [CHANGE] page_cluster ไม่รองรับการตั้งค่าเองผ่าน sysctl อีกต่อไป —
+ * ฟังก์ชันนี้เป็นเจ้าของค่านี้แต่เพียงผู้เดียว ทุก level ปรับตาม
+ * baseline/tiers ที่คำนวณจาก RAM เท่านั้น ไม่มี branch สำหรับ
+ * "เคารพค่า admin" หลงเหลืออยู่ — ตัด user_override/user_value ออกทั้งคู่
+ *
+ * Guarantee เดิมยังอยู่: level ที่สูงกว่า/เท่ากับสถานะ active ปัจจุบัน
+ * เขียนได้ทันที ไม่ถูก throttle บัง ส่วนการผ่อนคลายลงยัง throttle ตาม
+ * interval เพื่อกัน flapping
+ */
+void swap_cluster_adjust(int pressure_level)
+{
+	int cur_active, new_cluster, cur_val;
+
+	if (unlikely(pressure_level < 0 || pressure_level > 2))
+		return;
+
+	cur_active = atomic_read(&page_cluster_active_level);
+
+	if (pressure_level < cur_active) {
+		unsigned long now = jiffies;
+		unsigned long last = atomic_long_read(&swap_cluster_last_relax_jif);
+
+		if (likely(time_before(now, last + SWAP_CLUSTER_RELAX_INTERVAL)))
+			return;
+		if (atomic_long_cmpxchg(&swap_cluster_last_relax_jif,
+					 last, now) != last)
+			return;
+	}
+
+	atomic_set(&page_cluster_active_level, pressure_level);
+
+	switch (pressure_level) {
+	case 2:
+		new_cluster = 0;
+		break;
+	case 1:
+		new_cluster = max(page_cluster_baseline - 2, 1);
+		break;
+	default: /* level 0: กลับปกติ */
+		new_cluster = page_cluster_baseline;
+		break;
+	}
+
+	cur_val = READ_ONCE(page_cluster);
+	if (cur_val != new_cluster)
+		WRITE_ONCE(page_cluster, new_cluster);
+}
+
 void __init swap_setup(void)
 {
 	unsigned long megs = PAGES_TO_MB(totalram_pages());
 
-	/* Use a smaller cluster for small-memory machines */
-	if (megs < 16)
-		page_cluster = 2;
-	else
-		page_cluster = 3;
-	/*
-	 * Right now other parts of the system means that we
-	 * _really_ don't want to cluster much more
-	 */
+	page_cluster_baseline = compute_baseline_cluster(megs);
+	WRITE_ONCE(page_cluster, page_cluster_baseline);
 
 	register_sysctl_init("vm", swap_sysctl_table);
 }
