@@ -13398,33 +13398,12 @@ CONFIG_TEST_WORKQUEUE=n
 # Custom Lamud 71v1
 #################################################
 #################################################
-# ADIOS (Adaptive Deadline I/O scheduler)
-#################################################
-CONFIG_MQ_IOSCHED_ADIOS=n
-CONFIG_MQ_IOSCHED_DEFAULT_ADIOS=n
-#################################################
 # PRJC
 #################################################
 CONFIG_SCHED_PROXY_EXEC=n
 CONFIG_SCHED_ALT=y
 CONFIG_SCHED_BMQ=y
 CONFIG_SCHED_PDS=n
-#################################################
-# le9uo
-#################################################
-CONFIG_ANON_MIN_RATIO=1
-CONFIG_CLEAN_LOW_RATIO=15
-CONFIG_CLEAN_MIN_RATIO=4
-#################################################
-# Clang Options
-#################################################
-CONFIG_LTO_CLANG=n
-CONFIG_LTO_CLANG_THIN=n
-CONFIG_POLLY_CLANG=n
-#################################################
-# Tweaks
-#################################################
-CONFIG_TWEAKS=y
 #################################################
 # x86-64 compiler ISA level
 #################################################
