@@ -1139,14 +1139,21 @@ static const struct ctl_table swap_sysctl_table[] = {
 int page_cluster __read_mostly = 3;
 static int page_cluster_baseline __read_mostly = 3;
 
-/*
- * เก็บ "pressure level ที่ active อยู่ ณ ปัจจุบัน" แทนการ throttle ด้วยเวลาอย่างเดียว (ข้อ 2)
- * กติกา: level ที่สูงกว่าหรือเท่ากับ ตัวที่ active อยู่ เขียนทับได้เสมอ (ไม่ถูก throttle บัง)
- *        level ที่ต่ำกว่า ต้องรอ interval ผ่านไปก่อน ถึงจะ "ผ่อนคลาย" ลงได้
- */
 static atomic_t page_cluster_active_level = ATOMIC_INIT(0);
-static atomic_long_t swap_cluster_last_relax_jif = ATOMIC_LONG_INIT(0);
+static unsigned long swap_cluster_last_relax_jif;
 #define SWAP_CLUSTER_RELAX_INTERVAL   (HZ / 4)
+
+/*
+ * ครอบทั้ง read-decide-write ด้วย spinlock เดียว แทน
+ * atomic_read → atomic_set แยกก้าว (race ได้ถ้าเรียกพร้อมกันจากหลาย CPU
+ * เช่น kswapd หลาย NUMA node หรือ direct reclaim ชนกันตอน RAM วิกฤต)
+ * เดิม level 2 (วิกฤต) อาจถูก level 1 ที่มาพร้อมกันเขียนทับได้ เพราะ
+ * เช็ค "cur_active" กับ "ตั้งค่าใหม่" ไม่ใช่ operation เดียวกัน
+ *
+ * เรียกไม่บ่อย (ต่อรอบ reclaim/pressure event ไม่ใช่ per-I/O) ต้นทุน lock
+ * จึงต่ำมาก แลกกับ correctness ที่พิสูจน์ได้ ดีกว่า lock-free ที่ซับซ้อน
+ */
+static DEFINE_SPINLOCK(swap_cluster_lock);
 
 static const struct {
 	unsigned long min_megs;
@@ -1170,37 +1177,30 @@ static int __init compute_baseline_cluster(unsigned long megs)
 	return 2;
 }
 
-/*
- * swap_cluster_adjust - ปรับ page_cluster ตาม pressure level
- * @pressure_level: 0 ปกติ, 1 ตึง, 2 วิกฤต
- *
- * [CHANGE] page_cluster ไม่รองรับการตั้งค่าเองผ่าน sysctl อีกต่อไป —
- * ฟังก์ชันนี้เป็นเจ้าของค่านี้แต่เพียงผู้เดียว ทุก level ปรับตาม
- * baseline/tiers ที่คำนวณจาก RAM เท่านั้น ไม่มี branch สำหรับ
- * "เคารพค่า admin" หลงเหลืออยู่ — ตัด user_override/user_value ออกทั้งคู่
- *
- * Guarantee เดิมยังอยู่: level ที่สูงกว่า/เท่ากับสถานะ active ปัจจุบัน
- * เขียนได้ทันที ไม่ถูก throttle บัง ส่วนการผ่อนคลายลงยัง throttle ตาม
- * interval เพื่อกัน flapping
- */
 void swap_cluster_adjust(int pressure_level)
 {
-	int cur_active, new_cluster, cur_val;
+	int new_cluster, cur_val;
+	unsigned long flags;
 
 	if (unlikely(pressure_level < 0 || pressure_level > 2))
 		return;
 
-	cur_active = atomic_read(&page_cluster_active_level);
+	spin_lock_irqsave(&swap_cluster_lock, flags);
 
-	if (pressure_level < cur_active) {
+	/*
+	 * ตอนนี้ "อ่านสถานะ active" กับ "ตัดสินใจ throttle/เขียนทับ" อยู่ใน
+	 * critical section เดียวกัน — ไม่มีทางให้สัญญาณเบากว่ามาแทรกกลาง
+	 * แล้วเขียนทับสัญญาณวิกฤตที่เพิ่งตั้งไปหมาดๆ ได้อีกต่อไป
+	 */
+	if (pressure_level < atomic_read(&page_cluster_active_level)) {
 		unsigned long now = jiffies;
-		unsigned long last = atomic_long_read(&swap_cluster_last_relax_jif);
 
-		if (likely(time_before(now, last + SWAP_CLUSTER_RELAX_INTERVAL)))
+		if (time_before(now, swap_cluster_last_relax_jif +
+				 SWAP_CLUSTER_RELAX_INTERVAL)) {
+			spin_unlock_irqrestore(&swap_cluster_lock, flags);
 			return;
-		if (atomic_long_cmpxchg(&swap_cluster_last_relax_jif,
-					 last, now) != last)
-			return;
+		}
+		swap_cluster_last_relax_jif = now;
 	}
 
 	atomic_set(&page_cluster_active_level, pressure_level);
@@ -1220,6 +1220,8 @@ void swap_cluster_adjust(int pressure_level)
 	cur_val = READ_ONCE(page_cluster);
 	if (cur_val != new_cluster)
 		WRITE_ONCE(page_cluster, new_cluster);
+
+	spin_unlock_irqrestore(&swap_cluster_lock, flags);
 }
 
 void __init swap_setup(void)
