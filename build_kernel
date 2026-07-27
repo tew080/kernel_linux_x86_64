@@ -54,91 +54,123 @@
 #sudo ubuntu-drivers autoinstall
 #sudo apt install nvidia-driver-
 
+#clang install nvidia-dkms
+#sudo nano /usr/src/nvidia-595.84/dkms.conf
+#MAKE[0]="unset ARCH; [ ! -h /llvm19.0.0/bin ] && export CC=/llvm19.0.0/bin/clang; env NV_VERBOSE=1 \
+    #LLVM=1 LLVM_IAS=1 'make' -j$PROCS_NUM NV_EXCLUDE_BUILD_MODULES='' KERNEL_UNAME=${kernelver} IGNORE_XEN_PRESENCE=1 IGNORE_CC_MISMATCH=1 SYSSRC=$kernel_source_dir LD=/llvm19.0.0/bin/ld.lld>
+#sudo dkms install nvidia/595.84 -k 7.1.5-lamud-71v1xc
+
+#sudo dpkg --configure -a
+
 # ปิด systemd-oomd ที่ต้องใช้ PSI
 #sudo systemctl disable --now systemd-oomd
 # ติดตั้ง EarlyOOM หรือ Nohang แทน
 #sudo apt install earlyoom
 #sudo systemctl enable --now earlyoom
 
-if [[ $1 = "-c" || $1 = "--clean" ]]; then
-make clean
-make mrproper
+COMPILER="gcc" # ค่าเริ่มต้น
+CLEAN=0
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -c|--clean)
+            CLEAN=1
+            shift
+            ;;
+        -g|--gcc)
+            COMPILER="gcc"
+            shift
+            ;;
+        -l|--llvm|--clang)
+            COMPILER="clang"
+            shift
+            ;;
+        *)
+            echo "[ERROR] พารามิเตอร์ไม่ถูกต้อง: $1"
+            echo "วิธีใช้งาน: $0 [--clean] [--gcc | --clang]"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ $CLEAN -eq 1 ]]; then
+    echo "[INFO] กำลังทำความสะอาด Build area..."
+    make clean
+    make mrproper
 fi
 
-tool="/usr"
-
+tool="/home/tew404/kernel_build/llvm19.0.0"
 mkdir -p ~/tmp_build
 export TMPDIR=~/tmp_build
-
-#export LLVM=1
-#export LLVM_IAS=1
-export CC=/usr/bin/gcc-13
-export CXX=/usr/bin/g++-13
-export HOSTCC=/usr/bin/gcc-13
-export HOSTCXX=/usr/bin/g++-13
-export LD=/usr/bin/ld
-export AR=/usr/bin/ar
-export NM=/usr/bin/nm
-export STRIP=/usr/bin/strip
-export OBJCOPY=/usr/bin/objcopy
-export OBJDUMP=/usr/bin/objdump
-export READELF=/usr/bin/readelf
-export HOSTAR=/usr/bin/ar
-export HOSTLD=/usr/bin/ld
-#
 export PATH=$tool/bin:$PATH
-#export CFLAGS=--target=x86_64-linux-gnu
-#export CXXFLAGS=--target=x86_64-linux-gnu
-#export DEB_BUILD_GNU_TYPE=x86_64-linux-gnu
-
-#export KBUILD_NO_SYNC_CONFIG=1
-#export KCONFIG_NOTIMESTAMP=1
-#export KCONFIG_CONFIG="custom_config"
-#export KCONFIG_OVERWRITECONFIG=1
-#export KCONFIG_AUTOCONFIG=0
-
-#KERNEL_DIR="linux-6.15.2"
-#CONFIG_FILE="custom_config"
-
-#cd "$KERNEL_DIR" || { echo "เข้าโฟลเดอร์ Kernel ไม่ได้"; exit 1; }
-
-#cp "../$CONFIG_FILE" .config
-
-#echo "[INFO] ใช้ config: .config (จาก $CONFIG_FILE)"
-
-#cp /home/tew/kernel/test/custom_config
-
-#echo "[INFO] คอมไพล์ kernel เป็น .deb"
-
-cp custom_config .config
-
-#make custom_config savedefconfig
-
-#scripts/kconfig/merge_config.sh -m -r .config custom.config
-
-clang="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
-    KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
-    KCONFIG_OVERWRITECONFIG=1 \
-    LLVM=1 LLVM_IAS=1 bindeb-pkg "
-
-gcc="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
-    KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
-    KCONFIG_OVERWRITECONFIG=1 \
-    bindeb-pkg "
-
-ACTIVE_BUILD=$gcc
 
 # ==========================================
-# 5. ฟังก์ชันตรวจสอบการทำงาน
+# 2. ตั้งค่าตัวแปร Compiler ตามที่ผู้ใช้เลือก
+# ==========================================
+if [[ "$COMPILER" == "clang" ]]; then
+    # การตั้งค่าสำหรับ Clang / LLVM
+    export LLVM=1
+    export LLVM_IAS=1
+    export CC=$tool/bin/clang
+    export CXX=$tool/bin/clang++
+    export HOSTCC=$tool/bin/clang
+    export HOSTCXX=$tool/bin/clang++
+    export LD=$tool/bin/ld.lld
+    export AR=$tool/bin/llvm-ar
+    export NM=$tool/bin/llvm-nm
+    export STRIP=$tool/bin/llvm-strip
+    export OBJCOPY=$tool/bin/llvm-objcopy
+    export OBJDUMP=$tool/bin/llvm-objdump
+    export READELF=$tool/bin/llvm-readelf
+    export HOSTAR=$tool/bin/llvm-ar
+    export HOSTLD=$tool/bin/ld.lld
+
+    ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
+        KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
+        KCONFIG_OVERWRITECONFIG=1 \
+        LLVM=1 LLVM_IAS=1 bindeb-pkg"
+else
+    # การตั้งค่าสำหรับ GCC-13
+    unset LLVM
+    unset LLVM_IAS
+    export CC=$tool/bin/gcc-13
+    export CXX=$tool/bin/g++-13
+    export HOSTCC=$tool/bin/gcc-13
+    export HOSTCXX=$tool/bin/g++-13
+    export LD=$tool/bin/ld
+    export AR=$tool/bin/ar
+    export NM=$tool/bin/nm
+    export STRIP=$tool/bin/strip
+    export OBJCOPY=$tool/bin/objcopy
+    export OBJDUMP=$tool/bin/objdump
+    export READELF=$tool/bin/readelf
+    export HOSTAR=$tool/bin/ar
+    export HOSTLD=$tool/bin/ld
+
+    ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
+        KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
+        KCONFIG_OVERWRITECONFIG=1 \
+        bindeb-pkg"
+fi
+
+# ==========================================
+# 3. เตรียมไฟล์ Config
+# ==========================================
+cp custom_config .config
+
+# ==========================================
+# 4. ฟังก์ชันตรวจสอบการทำงาน
 # ==========================================
 check_compiler() {
     echo "----------------------------------------------------"
-    if [[ "$ACTIVE_BUILD" == *"LLVM=1"* ]]; then
+    if [[ "$COMPILER" == "clang" ]]; then
         echo "[INFO] โหมดคอมไพล์: CLANG / LLVM"
-        if command -v clang &> /dev/null; then
-            echo "[INFO] เวอร์ชันที่ใช้: $(clang --version | head -n 1)"
+        echo "[INFO] ตัวแปร CC ที่ตั้งไว้: $CC"
+        if command -v $CC &> /dev/null; then
+            echo "[INFO] เวอร์ชันที่ใช้: $($CC --version | head -n 1)"
         else
-            echo "[ERROR] ไม่พบคำสั่ง clang ในระบบ!"
+            echo "[ERROR] ไม่พบคำสั่ง $CC ในระบบ! โปรดติดตั้ง llvm และ clang"
+            exit 1
         fi
     else
         echo "[INFO] โหมดคอมไพล์: GCC"
@@ -146,19 +178,22 @@ check_compiler() {
         if command -v $CC &> /dev/null; then
             echo "[INFO] เวอร์ชันที่ใช้: $($CC --version | head -n 1)"
         else
-            echo "[ERROR] ไม่พบคำสั่ง $CC ในระบบ!"
+            echo "[ERROR] ไม่พบคำสั่ง $CC ในระบบ! โปรดตรวจสอบพาธ"
+            exit 1
         fi
     fi
     echo "----------------------------------------------------"
 }
 
-# เรียกใช้งานฟังก์ชันตรวจสอบก่อนเริ่ม make
+# ==========================================
+# 5. เริ่มกระบวนการ Build
+# ==========================================
 check_compiler
 
+# สร้าง Modules ก่อน
 make -j$(nproc) modules
 
-#make -j$(nproc) $gcc INSTALL_MOD_PATH=modules INSTALL_MOD_STRIP=1 modules_install
+# สร้างแพ็กเกจ .deb และติดตั้ง Modules พร้อม Strip
+make -j$(nproc) $ACTIVE_BUILD INSTALL_MOD_STRIP=1
 
-make -j$(nproc) $gcc INSTALL_MOD_STRIP=1
-
-echo "[✅]"
+echo "[✅] เสร็จสิ้นกระบวนการทำงาน!"
