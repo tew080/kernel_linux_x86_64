@@ -13414,6 +13414,10 @@ CONFIG_SCHED_PDS=n
 # x86-64 compiler ISA level
 #################################################
 CONFIG_X86_64_VERSION=3
+#################################################
+# acpi_call module
+#################################################
+CONFIG_ACPI_CALL=y
 
 CONFIG_AUTOFDO_CLANG=n
 CONFIG_PROPELLER_CLANG=n
