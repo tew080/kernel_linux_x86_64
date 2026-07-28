@@ -113,6 +113,9 @@ struct zram {
 	struct gendisk *disk;
 	/* Locks the device either in exclusive or in shared mode */
 	struct rw_semaphore dev_lock;
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	struct delayed_work adapt_work;   /* worker ปรับ compression ตาม RAM pressure อัตโนมัติ */
+#endif
 	/*
 	 * the number of pages zram can consume for storing compressed data
 	 */

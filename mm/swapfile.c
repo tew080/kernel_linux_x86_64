@@ -3619,6 +3619,24 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		prio = swap_flags & SWAP_FLAG_PRIO_MASK;
 
 	/*
+	 * เข้มงวดเท่ากันทั้งสองฝั่ง — บังคับ prio ตายตัวเสมอ
+	 * ไม่สนใจ SWAP_FLAG_PREFER ที่ user ส่งมาทั้งคู่ (`swapon -p N`)
+	 * ทั้ง zram และ swapfile ธรรมดา ตรงกับ policy "ห้ามผู้ใช้ปรับเอง"
+	 * ที่ยึดมาตลอดทั้งชุด (page_cluster, comp_algorithm, disksize)
+	 * ไม่ให้มีข้อยกเว้นเฉพาะจุดนี้อีกต่อไป
+	 *
+	 * ตรวจจากคุณสมบัติจริงของ block device (SWP_SYNCHRONOUS_IO ที่
+	 * คำนวณไว้แล้วด้านบน) แทนการเทียบ path string — ปลอมไม่ได้จาก
+	 * userspace เหมือนเดิม
+	 */
+	if (si->flags & SWP_SYNCHRONOUS_IO) {
+		/* อุปกรณ์ sync I/O แบบ zram/brd/pmem — เร็วกว่า disk จริงเสมอ */
+		prio = 90;
+	} else if (S_ISREG(inode->i_mode)) {
+		prio = 10;
+	}
+
+	/*
 	 * The plist prio is negated because plist ordering is
 	 * low-to-high, while swap ordering is high-to-low
 	 */

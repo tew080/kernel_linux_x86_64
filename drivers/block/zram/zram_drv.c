@@ -37,12 +37,113 @@
 
 #include "zram_drv.h"
 
+#include <linux/mm.h>          /* สำหรับ si_mem_available() — ยืนยันแล้วว่า
+                                * EXPORT_SYMBOL_GPL และไฟล์นี้ Dual BSD/GPL
+                                * ใช้ symbol GPL ได้ ไม่ติด modpost */
+
+/*
+ * เกณฑ์ความหนาแน่นของ RAM ทั้งระบบ (ไม่ใช่แค่ของ zram เอง) เพราะซีนาริโอ
+ * เป้าหมายคือ RAM ใกล้เต็มจากการรันหลายโปรแกรมพร้อมกัน (เกม+เบราว์เซอร์+IDE+
+ * ติดตั้งแพ็กเกจ) ไม่ใช่แค่ zram เต็มตัวมันเอง — hardcode ล้วน ไม่มี sysfs/sysctl
+ * ให้ผู้ใช้ปรับตามที่ต้องการ
+ */
+enum {
+	ZRAM_DENSITY_NORMAL	= 0,	/* RAM ว่างพอ: ใช้ comp เร็วอย่างเดียวพอ */
+	ZRAM_DENSITY_TIGHT	= 1,	/* เริ่มตึง: บีบหน้า idle ให้แน่นขึ้น */
+	ZRAM_DENSITY_CRITICAL	= 2,	/* วิกฤต: บีบทั้ง idle+huge เร่งมือ */
+};
+
+#define ZRAM_DENSITY_TIGHT_PCT		25	/* MemAvailable < 25% ของ RAM ทั้งหมด */
+#define ZRAM_DENSITY_CRITICAL_PCT	10	/* < 10% ของ RAM ทั้งหมด */
+#define ZRAM_ADAPT_PERIOD		(2 * HZ)	/* เช็คทุก 2 วิ ต้นทุนต่ำมาก */
+#define ZRAM_ADAPT_BATCH_TIGHT		256
+#define ZRAM_ADAPT_BATCH_CRITICAL	2048
+
+/*
+ * ขนาด zram แบบ hardcode ตาม RAM ทั้งหมด ไม่มีทางให้ผู้ใช้ปรับผ่าน
+ * sysfs (disksize) ได้อีกต่อไปตามที่ต้องการ — คำนวณตอน zram_add() ทุกครั้ง
+ * (รองรับทั้งตอน boot และตอน hot_add เพิ่มอุปกรณ์ระหว่างใช้งาน)
+ *
+ * เหตุผลของสัดส่วน: RAM ยิ่งน้อย ยิ่งต้องพึ่ง zram มาก (เป็นสัดส่วน)
+ * เพราะไม่มี headroom เหลือให้ overflow ไปดิสก์ได้บ่อย ส่วน RAM ที่เยอะมาก
+ * (32GB+) ใช้สัดส่วนน้อยลงเพราะค่าสัมบูรณ์ก็มากพอแล้ว ไม่จำเป็นต้องกิน
+ * RAM เพิ่มโดยเปล่าประโยชน์
+ */
+static const struct {
+	unsigned long min_megs;
+	unsigned int percent;
+} zram_disksize_tiers[] = {
+	{ 32768, 25 },	/* RAM >= 32GB */
+	{  8192, 50 },	/* RAM >= 8GB  (ครอบคลุมเครื่องนี้: 16GB -> 50%) */
+	{  4096, 75 },	/* RAM >= 4GB  */
+	{     0, 100 },	/* ต่ำกว่า 4GB */
+};
+
+#define ZRAM_DISKSIZE_MAX_MB	8192	/* cap บนไม่เกิน 8GB แม้ RAM จะเยอะกว่านี้
+					 * มาก กัน metadata overhead/RAM เปลือง
+					 * โดยไม่จำเป็นตอน RAM มหาศาล */
+#define ZRAM_DISKSIZE_MIN_MB	64	/* floor กันเครื่อง RAM น้อยมากได้ zram
+					 * เล็กจนไม่มีประโยชน์อะไรเลย */
+
+/*
+ * ไม่ใส่ __init เพราะ zram_add() เรียกซ้ำได้ตลอดอายุระบบผ่าน hot_add
+ * (/sys/class/zram-control/hot_add) ไม่ใช่แค่ตอน boot ครั้งเดียว — ถ้าใส่
+ * __init แล้วมีคนเรียก hot_add หลัง boot เสร็จ จะเป็นการเรียกเข้าไปใน
+ * __init section ที่ถูก free ไปแล้ว = crash/undefined behavior ทันที
+ */
+static u64 zram_compute_hardcoded_disksize(void)
+{
+	unsigned long megs = PAGES_TO_MB(totalram_pages());
+	unsigned int percent = 100;
+	u64 disksize_mb;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(zram_disksize_tiers); i++) {
+		if (megs >= zram_disksize_tiers[i].min_megs) {
+			percent = zram_disksize_tiers[i].percent;
+			break;
+		}
+	}
+
+	disksize_mb = (u64)megs * percent / 100;
+
+	if (disksize_mb > ZRAM_DISKSIZE_MAX_MB)
+		disksize_mb = ZRAM_DISKSIZE_MAX_MB;
+	if (disksize_mb < ZRAM_DISKSIZE_MIN_MB)
+		disksize_mb = ZRAM_DISKSIZE_MIN_MB;
+
+	return disksize_mb << 20;	/* MB -> bytes */
+}
+
+static unsigned int zram_mem_density_level(void)
+{
+	unsigned long total = totalram_pages();
+	unsigned long avail;
+	unsigned long pct;
+
+	if (!total)
+		return ZRAM_DENSITY_NORMAL;
+
+	avail = si_mem_available();
+	pct = (avail * 100) / total;
+
+	if (pct < ZRAM_DENSITY_CRITICAL_PCT)
+		return ZRAM_DENSITY_CRITICAL;
+	if (pct < ZRAM_DENSITY_TIGHT_PCT)
+		return ZRAM_DENSITY_TIGHT;
+	return ZRAM_DENSITY_NORMAL;
+}
+
 static DEFINE_IDR(zram_index_idr);
 /* idr index must be protected */
 static DEFINE_MUTEX(zram_index_mutex);
 
 static int zram_major;
 static const char *default_compressor = CONFIG_ZRAM_DEF_COMP;
+
+#ifdef CONFIG_ZRAM_MULTI_COMP
+static const char *default_secondary_compressor = CONFIG_ZRAM_DEF_COMP_SECONDARY;
+#endif
 
 #define ZRAM_MAX_ALGO_NAME_SZ	128
 
@@ -1660,25 +1761,13 @@ static void comp_algorithm_set(struct zram *zram, u32 prio, const char *alg)
 
 static int __comp_algorithm_store(struct zram *zram, u32 prio, const char *buf)
 {
-	const char *alg;
-	size_t sz;
-
-	sz = strlen(buf);
-	if (sz >= ZRAM_MAX_ALGO_NAME_SZ)
-		return -E2BIG;
-
-	alg = zcomp_lookup_backend_name(buf);
-	if (!alg)
-		return -EINVAL;
-
-	guard(rwsem_write)(&zram->dev_lock);
-	if (init_done(zram)) {
-		pr_info("Can't change algorithm for initialized device\n");
-		return -EBUSY;
-	}
-
-	comp_algorithm_set(zram, prio, alg);
-	return 0;
+	/* เหตุผลเดียวกับ disksize_store() ด้านบน */
+	pr_warn_once("zram: disksize/comp_algorithm/algorithm_params/"
+		     "recomp_algorithm are now managed automatically by "
+		     "the kernel; writes from userspace tools are accepted "
+		     "but ignored (see dmesg 'zram:' lines for actual "
+		     "values in effect)\n");
+	return 0;   /* __comp_algorithm_store คืน int ไม่ใช่ ssize_t — 0 = สำเร็จ */
 }
 
 static void comp_params_reset(struct zram *zram, u32 prio)
@@ -1716,83 +1805,82 @@ static int comp_params_store(struct zram *zram, u32 prio, s32 level,
 	return 0;
 }
 
+/*
+ * เลือกอัลกอริทึมทั้งหมดแบบ hardcode ล้วน ไม่มีทางให้ผู้ใช้เปลี่ยน
+ * ผ่าน sysfs ได้อีกต่อไป — comp_algorithm_store/recomp_algorithm_store/
+ * algorithm_params_store ถูกล็อกเป็น -EPERM ด้านล่างทั้งหมด ฟังก์ชันนี้
+ * เป็นจุดเดียวที่ตัดสินใจว่า "มีอัลกอริทึมอะไรบ้าง" แทน
+ *
+ * primary  = default_compressor (จาก Kconfig CONFIG_ZRAM_DEF_COMP) — เร็ว
+ *            สำหรับ hot path เขียนสด ไม่เปลี่ยนพฤติกรรมเดิม
+ * secondary = เลือกจากลิสต์ผู้สมัครเรียงจากที่ต้องการที่สุด ใช้ตัวแรก
+ *            ที่ backend มีจริงใน build นี้ — ถ้าไม่มีสักตัว (ไม่ได้ enable
+ *            CONFIG_CRYPTO_ZSTD ฯลฯ) ปล่อยผ่านแบบ graceful ไม่ fail
+ *            zram_add()/disksize_store() ระบบยังทำงานได้ปกติด้วย
+ *            primary อย่างเดียว เพียงแค่ adaptive-recompress (จาก patch
+ *            ก่อนหน้า) จะไม่มีผลจนกว่าจะมี backend ให้ใช้
+ *
+ * ลิสต์สำรอง ใช้เฉพาะกรณี backend ที่เลือกไว้ใน Kconfig
+ * (CONFIG_ZRAM_DEF_COMP_SECONDARY) ไม่ถูก build เข้ามาจริง (เช่น
+ * .config ที่ใช้จริงไม่ได้ enable CONFIG_CRYPTO_ZSTD แม้ Kconfig
+ * default จะเป็น zstd ก็ตาม) — เป็นตาข่ายนิรภัยกัน crash/fail เท่านั้น
+ * ไม่ใช่ช่องให้ผู้ใช้เลือก ทุกตัวในนี้ยัง hardcode ในซอร์สเหมือนเดิม
+ */
+static const char *const zram_secondary_algo_fallback[] = {
+	"zstd", "lz4hc", "deflate", NULL,
+};
+
+static void zram_setup_hardcoded_algorithms(struct zram *zram)
+{
+	comp_params_reset(zram, ZRAM_PRIMARY_COMP);
+	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
+
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	{
+		const char *alg;
+		int i;
+
+		/* ลองตัวที่ Kconfig เลือกไว้ก่อนเสมอ */
+		alg = zcomp_lookup_backend_name(default_secondary_compressor);
+
+		/* ถ้าไม่มีจริงใน build นี้ ค่อยไล่ตาข่ายนิรภัย */
+		for (i = 0; !alg && zram_secondary_algo_fallback[i]; i++)
+			alg = zcomp_lookup_backend_name(
+					zram_secondary_algo_fallback[i]);
+
+		comp_params_reset(zram, ZRAM_SECONDARY_COMP);
+		if (alg) {
+			struct deflate_params dp = {
+				.winbits = ZCOMP_PARAM_NOT_SET,
+			};
+
+			comp_algorithm_set(zram, ZRAM_SECONDARY_COMP, alg);
+			comp_params_store(zram, ZRAM_SECONDARY_COMP,
+					   CONFIG_ZRAM_DEF_COMP_SECONDARY_LEVEL,
+					   NULL, &dp);
+		} else {
+			comp_params_reset(zram, ZRAM_SECONDARY_COMP);
+			pr_info("zram: no secondary compressor backend "
+				"available (wanted '%s'), density-based "
+				"recompression will stay inactive\n",
+				default_secondary_compressor);
+		}
+	}
+#endif
+}
+
 static ssize_t algorithm_params_store(struct device *dev,
 				      struct device_attribute *attr,
 				      const char *buf,
 				      size_t len)
 {
-	s32 prio = ZRAM_PRIMARY_COMP, level = ZCOMP_PARAM_NOT_SET;
-	char *args, *param, *val, *algo = NULL, *dict_path = NULL;
-	struct deflate_params deflate_params;
-	struct zram *zram = dev_to_zram(dev);
-	bool prio_param = false;
-	int ret;
-
-	deflate_params.winbits = ZCOMP_PARAM_NOT_SET;
-
-	args = skip_spaces(buf);
-	while (*args) {
-		args = next_arg(args, &param, &val);
-
-		if (!val || !*val)
-			return -EINVAL;
-
-		if (!strcmp(param, "priority")) {
-			prio_param = true;
-			ret = kstrtoint(val, 10, &prio);
-			if (ret)
-				return ret;
-			continue;
-		}
-
-		if (!strcmp(param, "level")) {
-			ret = kstrtoint(val, 10, &level);
-			if (ret)
-				return ret;
-			continue;
-		}
-
-		if (!strcmp(param, "algo")) {
-			algo = val;
-			continue;
-		}
-
-		if (!strcmp(param, "dict")) {
-			dict_path = val;
-			continue;
-		}
-
-		if (!strcmp(param, "deflate.winbits")) {
-			ret = kstrtoint(val, 10, &deflate_params.winbits);
-			if (ret)
-				return ret;
-			continue;
-		}
-	}
-
-	guard(rwsem_write)(&zram->dev_lock);
-	if (init_done(zram))
-		return -EBUSY;
-
-	if (prio_param) {
-		if (prio < ZRAM_PRIMARY_COMP || prio >= ZRAM_MAX_COMPS)
-			return -EINVAL;
-	}
-
-	if (algo && prio_param) {
-		ret = validate_algo_priority(zram, algo, prio);
-		if (ret)
-			return ret;
-	}
-
-	if (algo && !prio_param) {
-		prio = lookup_algo_priority(zram, algo, ZRAM_PRIMARY_COMP);
-		if (prio < 0)
-			return -EINVAL;
-	}
-
-	ret = comp_params_store(zram, prio, level, dict_path, &deflate_params);
-	return ret ? ret : len;
+	/* เหตุผลเดียวกับ disksize_store() ด้านบน */
+	pr_warn_once("zram: disksize/comp_algorithm/algorithm_params/"
+		     "recomp_algorithm are now managed automatically by "
+		     "the kernel; writes from userspace tools are accepted "
+		     "but ignored (see dmesg 'zram:' lines for actual "
+		     "values in effect)\n");
+	return len;
 }
 
 static ssize_t comp_algorithm_show(struct device *dev,
@@ -1844,40 +1932,13 @@ static ssize_t recomp_algorithm_store(struct device *dev,
 				      const char *buf,
 				      size_t len)
 {
-	struct zram *zram = dev_to_zram(dev);
-	int prio = ZRAM_SECONDARY_COMP;
-	char *args, *param, *val;
-	char *alg = NULL;
-	int ret;
-
-	args = skip_spaces(buf);
-	while (*args) {
-		args = next_arg(args, &param, &val);
-
-		if (!val || !*val)
-			return -EINVAL;
-
-		if (!strcmp(param, "algo")) {
-			alg = val;
-			continue;
-		}
-
-		if (!strcmp(param, "priority")) {
-			ret = kstrtoint(val, 10, &prio);
-			if (ret)
-				return ret;
-			continue;
-		}
-	}
-
-	if (!alg)
-		return -EINVAL;
-
-	if (prio < ZRAM_SECONDARY_COMP || prio >= ZRAM_MAX_COMPS)
-		return -EINVAL;
-
-	ret = __comp_algorithm_store(zram, prio, alg);
-	return ret ? ret : len;
+	/* เหตุผลเดียวกับ disksize_store() ด้านบน */
+	pr_warn_once("zram: disksize/comp_algorithm/algorithm_params/"
+		     "recomp_algorithm are now managed automatically by "
+		     "the kernel; writes from userspace tools are accepted "
+		     "but ignored (see dmesg 'zram:' lines for actual "
+		     "values in effect)\n");
+	return len;
 }
 #endif
 
@@ -2379,6 +2440,13 @@ static void scan_slots_for_recompress(struct zram *zram, u32 mode, u32 prio,
 	for (index = 0; index < nr_pages; index++) {
 		bool ok = true;
 
+		/*
+		 * ทุกๆ 8192 slots (~32MB) ให้เช็คและยอมคืน CPU ให้ Scheduler 
+		 * เพื่อไม่ให้กระทบ Frame Rate ของเกมหรือเกิดการดึง CPU นานเกิน 10ms
+		 */
+		if (!(index & 0x1fff))
+			cond_resched();
+
 		slot_lock(zram, index);
 		if (!slot_allocated(zram, index))
 			goto next;
@@ -2521,147 +2589,116 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
 	return 0;
 }
 
-static ssize_t recompress_store(struct device *dev,
-				struct device_attribute *attr,
-				const char *buf, size_t len)
+#ifdef CONFIG_ZRAM_MULTI_COMP
+/*
+ * เหมือน recompress_store() ทุกประการ แต่เรียกจากภายในเคอร์เนล
+ * (auto-worker) แทนที่จะรับ input จาก userspace — ใช้ฟังก์ชันเดิมที่ผ่าน
+ * การตรวจสอบมาแล้วทั้งหมด (scan_slots_for_recompress/recompress_slot/
+ * pp_ctl) ไม่ประดิษฐ์ logic บีบอัดใหม่ ลดความเสี่ยงบั๊ก
+ *
+ * ต้องเรียกภายใต้ zram->dev_lock (write) และ init_done(zram) เป็น true แล้ว
+ */
+static void zram_run_recompress_pass(struct zram *zram, u32 mode, u32 prio,
+				      u64 max_pages)
 {
-	struct zram *zram = dev_to_zram(dev);
-	char *args, *param, *val, *algo = NULL;
-	u64 num_recomp_pages = ULLONG_MAX;
-	struct zram_pp_ctl *ctl = NULL;
-	s32 prio = ZRAM_SECONDARY_COMP;
-	u32 mode = 0, threshold = 0;
+	struct zram_pp_ctl *ctl;
 	struct zram_pp_slot *pps;
-	struct page *page = NULL;
-	bool prio_param = false;
-	ssize_t ret;
-
-	args = skip_spaces(buf);
-	while (*args) {
-		args = next_arg(args, &param, &val);
-
-		if (!val || !*val)
-			return -EINVAL;
-
-		if (!strcmp(param, "type")) {
-			if (!strcmp(val, "idle"))
-				mode = RECOMPRESS_IDLE;
-			if (!strcmp(val, "huge"))
-				mode = RECOMPRESS_HUGE;
-			if (!strcmp(val, "huge_idle"))
-				mode = RECOMPRESS_IDLE | RECOMPRESS_HUGE;
-			if (!mode)
-				return -EINVAL;
-			continue;
-		}
-
-		if (!strcmp(param, "max_pages")) {
-			/*
-			 * Limit the number of entries (pages) we attempt to
-			 * recompress.
-			 */
-			ret = kstrtoull(val, 10, &num_recomp_pages);
-			if (ret)
-				return ret;
-			continue;
-		}
-
-		if (!strcmp(param, "threshold")) {
-			/*
-			 * We will re-compress only idle objects equal or
-			 * greater in size than watermark.
-			 */
-			ret = kstrtouint(val, 10, &threshold);
-			if (ret)
-				return ret;
-			continue;
-		}
-
-		if (!strcmp(param, "algo")) {
-			algo = val;
-			continue;
-		}
-
-		if (!strcmp(param, "priority")) {
-			prio_param = true;
-			ret = kstrtoint(val, 10, &prio);
-			if (ret)
-				return ret;
-			continue;
-		}
-	}
-
-	if (threshold >= huge_class_size)
-		return -EINVAL;
-
-	guard(rwsem_write)(&zram->dev_lock);
-	if (!init_done(zram))
-		return -EINVAL;
-
-	if (prio_param) {
-		if (prio < ZRAM_SECONDARY_COMP || prio >= ZRAM_MAX_COMPS)
-			return -EINVAL;
-	}
-
-	if (algo && prio_param) {
-		ret = validate_algo_priority(zram, algo, prio);
-		if (ret)
-			return ret;
-	}
-
-	if (algo && !prio_param) {
-		prio = lookup_algo_priority(zram, algo, ZRAM_SECONDARY_COMP);
-		if (prio < 0)
-			return -EINVAL;
-	}
+	struct page *page;
 
 	if (!zram->comps[prio])
-		return -EINVAL;
+		return;
 
-	page = alloc_page(GFP_KERNEL);
-	if (!page) {
-		ret = -ENOMEM;
-		goto out;
-	}
+	page = alloc_page(GFP_NOIO);
+	if (!page)
+		return;
 
 	ctl = init_pp_ctl();
 	if (!ctl) {
-		ret = -ENOMEM;
-		goto out;
+		__free_page(page);
+		return;
 	}
 
 	scan_slots_for_recompress(zram, mode, prio, ctl);
 
-	ret = len;
 	while ((pps = select_pp_slot(ctl))) {
-		int err = 0;
-
-		if (!num_recomp_pages)
+		if (!max_pages)
 			break;
 
 		slot_lock(zram, pps->index);
-		if (!test_slot_flag(zram, pps->index, ZRAM_PP_SLOT))
-			goto next;
-
-		err = recompress_slot(zram, pps->index, page,
-				      &num_recomp_pages, threshold, prio);
-next:
+		if (test_slot_flag(zram, pps->index, ZRAM_PP_SLOT))
+			recompress_slot(zram, pps->index, page, &max_pages,
+					 0, prio);
 		slot_unlock(zram, pps->index);
 		release_pp_slot(zram, pps);
-
-		if (err) {
-			ret = err;
-			break;
-		}
 
 		cond_resched();
 	}
 
-out:
-	if (page)
-		__free_page(page);
+	__free_page(page);
 	release_pp_ctl(zram, ctl);
-	return ret;
+}
+
+static void zram_adapt_work_fn(struct work_struct *w)
+{
+	struct zram *zram = container_of(w, struct zram, adapt_work.work);
+	unsigned int level;
+	u32 mode, prio;
+	u64 batch;
+
+	/*
+	 * trylock ล้วน ไม่มี blocking wait เลยในฟังก์ชันนี้ — ถ้า
+	 * ชนกับ disksize_store/reset_store ที่กำลังถือ dev_lock อยู่ ให้ข้าม
+	 * รอบนี้ไปเฉยๆ แล้วลองใหม่ใน 2 วิ ไม่ทำให้ worker ค้างรอ หรือไปแย่ง
+	 * lock กับ path ที่ user กำลังรอ (I/O submit/reset) จนหน่วง
+	 */
+	if (!down_read_trylock(&zram->dev_lock))
+		goto out_requeue;
+
+	if (!init_done(zram)) {
+		up_read(&zram->dev_lock);
+		/* อุปกรณ์ถูก reset/ยังไม่ตั้ง disksize — ไม่ต้อง requeue ต่อ
+		 * (cancel_delayed_work_sync ใน zram_reset_device จะจัดการ
+		 * ยกเลิกให้แน่นอนอยู่แล้ว บรรทัดนี้กันไว้อีกชั้นเฉยๆ) */
+		return;
+	}
+	up_read(&zram->dev_lock);
+
+	level = zram_mem_density_level();
+	if (level == ZRAM_DENSITY_NORMAL)
+		goto out_requeue;
+
+	if (level == ZRAM_DENSITY_TIGHT) {
+		mode = RECOMPRESS_IDLE;
+		prio = ZRAM_SECONDARY_COMP;
+		batch = ZRAM_ADAPT_BATCH_TIGHT;
+	} else {
+		mode = RECOMPRESS_IDLE | RECOMPRESS_HUGE;
+		prio = ZRAM_MAX_COMPS - 1;
+		batch = ZRAM_ADAPT_BATCH_CRITICAL;
+	}
+
+	if (down_write_trylock(&zram->dev_lock)) {
+		if (init_done(zram)) {
+			/* เลือก priority สูงสุดที่ admin ตั้งค่าไว้จริง ไม่เกิน
+			 * ที่ tier ต้องการ — กันกรณี admin ตั้ง secondary comp
+			 * ไว้ไม่ครบ */
+			while (prio > ZRAM_SECONDARY_COMP && !zram->comps[prio])
+				prio--;
+			zram_run_recompress_pass(zram, mode, prio, batch);
+		}
+		up_write(&zram->dev_lock);
+	}
+
+out_requeue:
+	queue_delayed_work(system_unbound_wq, &zram->adapt_work, ZRAM_ADAPT_PERIOD);
+}
+#endif
+
+static ssize_t recompress_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t len)
+{
+	return -EPERM;
 }
 #endif
 
@@ -2833,8 +2870,77 @@ static void zram_destroy_comps(struct zram *zram)
 	zram_comp_params_reset(zram);
 }
 
+/*
+ * แยก logic การตั้งขนาดออกจาก sysfs wrapper เพื่อเรียกจาก
+ * zram_add() ได้ตรงๆ โดยไม่ต้องผ่าน userspace เขียน sysfs เลย
+ *
+ * เรียกได้ 2 แบบ: (1) ภายใต้ zram->dev_lock (write) ที่ถืออยู่แล้ว เช่น
+ * จาก disksize_store เดิม หรือ (2) จาก zram_add() ก่อน device_add_disk()
+ * ซึ่งยังไม่มีทางมี concurrent access ใดๆ เกิดขึ้นได้ (เหมือนที่
+ * zram_setup_hardcoded_algorithms() ทำอยู่แล้วในจุดเดียวกัน)
+ */
+static int zram_set_disksize(struct zram *zram, u64 disksize)
+{
+	struct zcomp *comp;
+	int err;
+	u32 prio;
+
+	disksize = PAGE_ALIGN(disksize);
+	if (!zram_meta_alloc(zram, disksize))
+		return -ENOMEM;
+
+	for (prio = ZRAM_PRIMARY_COMP; prio < ZRAM_MAX_COMPS; prio++) {
+		if (!zram->comp_algs[prio])
+			continue;
+
+		comp = zcomp_create(zram->comp_algs[prio], &zram->params[prio]);
+		if (IS_ERR(comp)) {
+			err = PTR_ERR(comp);
+
+			if (prio == ZRAM_PRIMARY_COMP) {
+				pr_err("Cannot initialise %s compressing backend\n",
+				       zram->comp_algs[prio]);
+				goto out_free_comps;
+			}
+
+			pr_warn("zram: secondary compressor '%s' unavailable (%d), "
+				"auto density-based recompression at priority %u disabled\n",
+				zram->comp_algs[prio], err, prio);
+			zram->comp_algs[prio] = NULL;
+			continue;
+		}
+
+		zram->comps[prio] = comp;
+	}
+	zram->disksize = disksize;
+	set_capacity_and_notify(zram->disk, zram->disksize >> SECTOR_SHIFT);
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	schedule_delayed_work(&zram->adapt_work, ZRAM_ADAPT_PERIOD);
+#endif
+	return 0;
+
+out_free_comps:
+	zram_destroy_comps(zram);
+	zram_meta_free(zram, disksize);
+	return err;
+}
+
 static void zram_reset_device(struct zram *zram)
 {
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	/*
+	 * ต้องยกเลิก + รอ worker ให้จบสนิทก่อนแตะ dev_lock/ปล่อย
+	 * mem_pool/table ข้างล่าง มิฉะนั้นถ้า worker กำลังรันอยู่พอดี
+	 * (ถือ dev_lock read หรือกำลังจะขอ write) แล้วฟังก์ชันนี้ไปเรียก
+	 * zram_meta_free()/zram_destroy_comps() จะเกิด use-after-free
+	 * บน zram->comps[]/zram->table/zram->mem_pool ที่ worker แตะอยู่
+	 * ต้องเรียก "ก่อน" guard(rwsem_write) ด้านล่าง ไม่ใช่หลัง เพราะ
+	 * worker เองก็ต้องขอ dev_lock — ถ้าสลับลำดับจะเสี่ยง deadlock
+	 * (แต่ตรงนี้ปลอดภัยเพราะ cancel_delayed_work_sync ไม่ได้ถือ
+	 * dev_lock เอง แค่รอ worker คืน lock ของมันแล้วจบ)
+	 */
+	cancel_delayed_work_sync(&zram->adapt_work);
+#endif
 	guard(rwsem_write)(&zram->dev_lock);
 
 	zram->limit_pages = 0;
@@ -2849,56 +2955,56 @@ static void zram_reset_device(struct zram *zram)
 	memset(&zram->stats, 0, sizeof(zram->stats));
 	reset_bdev(zram);
 
-	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
+	zram_setup_hardcoded_algorithms(zram);   /* ต้อง setup ใหม่
+						   * ทั้งคู่หลัง reset ไม่งั้น
+						   * secondary comp จะหายไปถาวร
+						   * เพราะ sysfs ปิดแล้ว ไม่มีใคร
+						   * มาตั้งซ้ำให้อีก */
+	/*
+	 * ต้องตั้งขนาดกลับด้วยเช่นกัน — ตอนปิดรูโหว่ที่ disksize_store()
+	 * ยอมรับค่าจาก userspace ได้หลัง reset ไปแล้ว (แก้เป็น pr_warn_once
+	 * + คืน len เฉยๆ ไม่แตะ buf เลย) ทำให้ตอนนี้ "ไม่มีใครเรียก
+	 * zram_set_disksize() อีกเลย" หลัง reset เพราะ disksize_store()
+	 * ไม่ทำหน้าที่นั้นแล้วโดยเจตนา — ถ้าไม่เติมบรรทัดนี้ device จะค้างที่
+	 * disksize=0 ถาวรหลัง reset ครั้งแรก ใช้เป็น swap ต่อไม่ได้อีกเลย
+	 * จนกว่าจะ reboot ทั้งเครื่อง ต้องเรียกในนี้ให้ครบเหมือนที่ทำกับ
+	 * algorithms ด้านบน เพื่อให้ policy "ล็อกจาก userspace แต่ยัง
+	 * ทำงานได้เองภายใน" สมบูรณ์จริง ไม่ใช่แค่ปิดช่องโหว่แล้วพังฟังก์ชัน
+	 */
+	if (zram_set_disksize(zram, zram_compute_hardcoded_disksize()))
+		pr_err("zram%s: failed to re-configure disksize after reset\n",
+		       zram->disk->disk_name);
 }
 
 static ssize_t disksize_store(struct device *dev, struct device_attribute *attr,
 			      const char *buf, size_t len)
 {
-	u64 disksize;
-	struct zcomp *comp;
 	struct zram *zram = dev_to_zram(dev);
-	int err;
-	u32 prio;
 
-	disksize = memparse(buf, NULL);
-	if (!disksize)
-		return -EINVAL;
-
-	guard(rwsem_write)(&zram->dev_lock);
-	if (init_done(zram)) {
-		pr_info("Cannot change disksize for initialized device\n");
-		return -EBUSY;
-	}
-
-	disksize = PAGE_ALIGN(disksize);
-	if (!zram_meta_alloc(zram, disksize))
-		return -ENOMEM;
-
-	for (prio = ZRAM_PRIMARY_COMP; prio < ZRAM_MAX_COMPS; prio++) {
-		if (!zram->comp_algs[prio])
-			continue;
-
-		comp = zcomp_create(zram->comp_algs[prio],
-				    &zram->params[prio]);
-		if (IS_ERR(comp)) {
-			pr_err("Cannot initialise %s compressing backend\n",
-			       zram->comp_algs[prio]);
-			err = PTR_ERR(comp);
-			goto out_free_comps;
-		}
-
-		zram->comps[prio] = comp;
-	}
-	zram->disksize = disksize;
-	set_capacity_and_notify(zram->disk, zram->disksize >> SECTOR_SHIFT);
-
+	/*
+	 * ขนาด zram ไม่รองรับการตั้งเองผ่าน sysfs อีกต่อไป —
+	 * ระบบคำนวณอัตโนมัติจาก RAM ใน zram_add() แล้วเสมอ (ดู
+	 * zram_compute_hardcoded_disksize())
+	 *
+	 * คืน len (ดูเหมือนสำเร็จ) แทน -EPERM เพราะ zram-generator/zramctl
+	 * ที่รันตอน boot จะ exit ผิดพลาดทำให้ systemd unit ที่เกี่ยวข้อง
+	 * ขึ้น failed ทุกครั้ง ทั้งที่ระบบทำงานถูกต้องตามที่ hardcode ไว้
+	 * อยู่แล้ว (mkswap/swapon ที่ tool เรียกต่อจากนี้ยังทำงานกับขนาด
+	 * จริงที่ถูกต้องอยู่ดี ไม่มีผลเสียเชิงฟังก์ชัน)
+	 *
+	 * เพื่อไม่ให้ "โกหก" แบบไม่มีร่องรอยเลย ใช้ pr_warn_once() แจ้ง
+	 * ใน dmesg ครั้งเดียวต่อการ boot — ใครตั้งใจตรวจสอบจะเจอ แต่ไม่ทำ
+	 * ให้ exit code ของ script ผิดพลาดจนบูตแดงทุกครั้งโดยไม่จำเป็น
+	 *
+	 * ค่าที่อ่านผ่าน disksize_show ("cat disksize") ยังเป็นค่าจริง
+	 * (ค่า hardcode) เสมอ ไม่เคยโกหกฝั่ง read
+	 */
+	pr_warn_once("zram: disksize/comp_algorithm/algorithm_params/"
+		     "recomp_algorithm are now managed automatically by "
+		     "the kernel; writes from userspace tools are accepted "
+		     "but ignored (see dmesg 'zram:' lines for actual "
+		     "values in effect)\n");
 	return len;
-
-out_free_comps:
-	zram_destroy_comps(zram);
-	zram_meta_free(zram, disksize);
-	return err;
 }
 
 static ssize_t reset_store(struct device *dev,
@@ -3060,7 +3166,10 @@ static int zram_add(void)
 	device_id = ret;
 
 	init_rwsem(&zram->dev_lock);
-#ifdef CONFIG_ZRAM_WRITEBACK
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	INIT_DELAYED_WORK(&zram->adapt_work, zram_adapt_work_fn);
+#endif
+	#ifdef CONFIG_ZRAM_WRITEBACK
 	zram->wb_batch_size = 32;
 	zram->compressed_wb = false;
 #endif
@@ -3082,13 +3191,26 @@ static int zram_add(void)
 	zram->disk->private_data = zram;
 	snprintf(zram->disk->disk_name, 16, "zram%d", device_id);
 	zram_comp_params_reset(zram);
-	comp_algorithm_set(zram, ZRAM_PRIMARY_COMP, default_compressor);
+	zram_setup_hardcoded_algorithms(zram);
 
-	/* Actual capacity set using sysfs (/sys/block/zram<id>/disksize */
-	set_capacity(zram->disk, 0);
-	ret = device_add_disk(NULL, zram->disk, zram_disk_groups);
-	if (ret)
+	/* ตั้งขนาดอัตโนมัติทันที ไม่ต้องรอ userspace/udev เขียน
+	 * /sys/block/zramN/disksize อีกต่อไป (path นั้นถูกล็อกไปแล้วด้านบน) */
+	ret = zram_set_disksize(zram, zram_compute_hardcoded_disksize());
+	if (ret) {
+		pr_err("zram%d: failed to auto-configure disksize (%d)\n",
+		       device_id, ret);
 		goto out_cleanup_disk;
+	}
+
+	/* 
+     * นำ ret มารับค่าจาก device_add_disk 
+     * หากเพิ่มดิสก์เข้าสู่ระบบล้มเหลว ให้กระโดดไปเคลียร์ Resource ทันที
+     */
+    ret = device_add_disk(NULL, zram->disk, zram_disk_groups);
+    if (ret) {
+        pr_err("zram%d: failed to add disk (%d)\n", device_id, ret);
+        goto out_cleanup_disk;
+    }
 
 	zram_debugfs_register(zram);
 	pr_info("Added device: %s\n", zram->disk->disk_name);

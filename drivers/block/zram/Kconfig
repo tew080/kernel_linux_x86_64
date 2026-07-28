@@ -104,6 +104,26 @@ config ZRAM_DEF_COMP
 	default "842" if ZRAM_DEF_COMP_842
 	default "unset-value"
 
+config ZRAM_DEF_COMP_SECONDARY
+	string "Default secondary zram compressor (auto density-based recompress)"
+	default "zstd"
+	depends on ZRAM_MULTI_COMP
+	help
+	  ตัวบีบอัดสำรองที่ใช้ตอน background recompress อัตโนมัติ (ตอน RAM
+	  ตึง/วิกฤต) ต้องเป็นตัวที่อัตราส่วนดีกว่า ZRAM_DEF_COMP แลกกับ CPU
+	  ที่หนักกว่า (เพราะถูกเรียกเฉพาะตอน RAM ใกล้เต็มอยู่แล้ว)
+
+	  ค่านี้กำหนดตอน build/config kernel เท่านั้น ไม่มีทาง override
+	  ผ่าน sysfs ได้ในระหว่างใช้งานจริง (เหมือน ZRAM_DEF_COMP)
+
+config ZRAM_DEF_COMP_SECONDARY_LEVEL
+	int "Default secondary zram compressor level"
+	default 3
+	depends on ZRAM_MULTI_COMP
+	help
+	  Level ของตัวบีบอัดสำรอง ตั้งไว้กลางๆ โดย default (ไม่ใช่สูงสุด)
+	  เพื่อไม่ให้แย่ง CPU มากเกินไปตอนระบบกำลังตึงอยู่แล้ว
+	  
 config ZRAM_WRITEBACK
        bool "Write back incompressible or idle page to backing device"
        depends on ZRAM
