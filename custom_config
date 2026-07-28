@@ -42,7 +42,7 @@ CONFIG_THREAD_INFO_IN_TASK=y
 CONFIG_INIT_ENV_ARG_LIMIT=32
 # CONFIG_COMPILE_TEST is not set
 # CONFIG_WERROR is not set
-CONFIG_LOCALVERSION="-lamud-71v1xc"
+CONFIG_LOCALVERSION="-lamud-71v2xc"
 # CONFIG_LOCALVERSION_AUTO is not set
 CONFIG_BUILD_SALT=""
 CONFIG_HAVE_KERNEL_GZIP=y
@@ -2860,18 +2860,18 @@ CONFIG_ZRAM_BACKEND_ZSTD=y
 CONFIG_ZRAM_BACKEND_DEFLATE=y
 CONFIG_ZRAM_BACKEND_842=y
 CONFIG_ZRAM_BACKEND_LZO=y
-CONFIG_ZRAM_DEF_COMP_LZORLE=y
+# CONFIG_ZRAM_DEF_COMP_LZORLE is not set
 # CONFIG_ZRAM_DEF_COMP_LZO is not set
-# CONFIG_ZRAM_DEF_COMP_LZ4 is not set
+CONFIG_ZRAM_DEF_COMP_LZ4=y
 # CONFIG_ZRAM_DEF_COMP_LZ4HC is not set
 # CONFIG_ZRAM_DEF_COMP_ZSTD is not set
 # CONFIG_ZRAM_DEF_COMP_DEFLATE is not set
 # CONFIG_ZRAM_DEF_COMP_842 is not set
-CONFIG_ZRAM_DEF_COMP="lzo-rle"
+CONFIG_ZRAM_DEF_COMP="lz4"
 CONFIG_ZRAM_WRITEBACK=y
 CONFIG_ZRAM_TRACK_ENTRY_ACTIME=y
 CONFIG_ZRAM_MEMORY_TRACKING=y
-# CONFIG_ZRAM_MULTI_COMP is not set
+CONFIG_ZRAM_MULTI_COMP=y
 CONFIG_BLK_DEV_LOOP=y
 CONFIG_BLK_DEV_LOOP_MIN_COUNT=8
 CONFIG_BLK_DEV_DRBD=m
@@ -13418,6 +13418,17 @@ CONFIG_X86_64_VERSION=3
 # acpi_call module
 #################################################
 CONFIG_ACPI_CALL=y
+#################################################
+# Default secondary zram compressor (auto density-based recompress)
+#################################################
+CONFIG_ZRAM_DEF_COMP_SECONDARY="zstd"
+#################################################
+# Default secondary zram compressor level
+#################################################
+CONFIG_ZRAM_DEF_COMP_SECONDARY_LEVEL=3
+
+
+
 
 CONFIG_AUTOFDO_CLANG=n
 CONFIG_PROPELLER_CLANG=n
