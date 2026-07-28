@@ -73,8 +73,13 @@
  * If no ancestor relationship:
  * arbitrary, since it's serialized on rename_lock
  */
+#ifdef CONFIG_TWEAKS
+static int sysctl_vfs_cache_pressure __read_mostly = 50;
+static int sysctl_vfs_cache_pressure_denom __read_mostly = 100;
+#else
 static int sysctl_vfs_cache_pressure __read_mostly = 100;
 static int sysctl_vfs_cache_pressure_denom __read_mostly = 100;
+#endif
 
 unsigned long vfs_pressure_ratio(unsigned long val)
 {
@@ -223,7 +228,11 @@ static const struct ctl_table vm_dcache_sysctls[] = {
 		.procname	= "vfs_cache_pressure",
 		.data		= &sysctl_vfs_cache_pressure,
 		.maxlen		= sizeof(sysctl_vfs_cache_pressure),
-		.mode		= 0644,
+#ifdef CONFIG_TWEAKS
+		.mode       = 0444,
+#else
+		.mode       = 0644,
+#endif
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 	},
@@ -231,7 +240,11 @@ static const struct ctl_table vm_dcache_sysctls[] = {
 		.procname	= "vfs_cache_pressure_denom",
 		.data		= &sysctl_vfs_cache_pressure_denom,
 		.maxlen		= sizeof(sysctl_vfs_cache_pressure_denom),
-		.mode		= 0644,
+#ifdef CONFIG_TWEAKS
+		.mode       = 0444,
+#else
+		.mode       = 0644,
+#endif
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ONE_HUNDRED,
 	},

@@ -267,8 +267,13 @@ const char * const migratetype_names[MIGRATE_TYPES] = {
 
 int min_free_kbytes = 1024;
 int user_min_free_kbytes = -1;
+#ifdef CONFIG_TWEAKS
+static int watermark_boost_factor __read_mostly = 5000;
+static int watermark_scale_factor = 10;
+#else
 static int watermark_boost_factor __read_mostly = 15000;
 static int watermark_scale_factor = 10;
+#endif
 int defrag_mode;
 
 /* movable_zone is the "real" zone pages in ZONE_MOVABLE are taken from */
@@ -6687,7 +6692,11 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
 		.procname	= "watermark_boost_factor",
 		.data		= &watermark_boost_factor,
 		.maxlen		= sizeof(watermark_boost_factor),
-		.mode		= 0644,
+#ifdef CONFIG_TWEAKS
+		.mode       = 0444,
+#else
+		.mode       = 0644,
+#endif
 		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= SYSCTL_ZERO,
 	},
@@ -6695,7 +6704,11 @@ static const struct ctl_table page_alloc_sysctl_table[] = {
 		.procname	= "watermark_scale_factor",
 		.data		= &watermark_scale_factor,
 		.maxlen		= sizeof(watermark_scale_factor),
-		.mode		= 0644,
+#ifdef CONFIG_TWEAKS
+		.mode       = 0444,
+#else
+		.mode       = 0644,
+#endif
 		.proc_handler	= watermark_scale_factor_sysctl_handler,
 		.extra1		= SYSCTL_ONE,
 		.extra2		= SYSCTL_THREE_THOUSAND,

@@ -47,7 +47,12 @@ static const struct {
 
 static struct ratelimit_state bld_ratelimit;
 
+#ifdef CONFIG_TWEAKS
+static unsigned int sysctl_sld_mitigate = 0;
+#else
 static unsigned int sysctl_sld_mitigate = 1;
+#endif
+
 static DEFINE_SEMAPHORE(buslock_sem, 1);
 
 #ifdef CONFIG_PROC_SYSCTL
@@ -56,7 +61,11 @@ static const struct ctl_table sld_sysctls[] = {
 		.procname       = "split_lock_mitigate",
 		.data           = &sysctl_sld_mitigate,
 		.maxlen         = sizeof(unsigned int),
-		.mode           = 0644,
+#ifdef CONFIG_TWEAKS
+		.mode       = 0444,
+#else
+		.mode       = 0644,
+#endif
 		.proc_handler	= proc_douintvec_minmax,
 		.extra1         = SYSCTL_ZERO,
 		.extra2         = SYSCTL_ONE,

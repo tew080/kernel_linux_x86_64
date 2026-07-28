@@ -427,6 +427,10 @@ proc_dolongvec_minmax_bpf_restricted(const struct ctl_table *table, int write,
 }
 #endif
 
+#ifdef CONFIG_TWEAKS
+static int netdev_max_backlog = 4096;
+#endif
+
 static struct ctl_table net_core_table[] = {
 	{
 		.procname	= "mem_pcpu_rsv",
@@ -462,9 +466,15 @@ static struct ctl_table net_core_table[] = {
 	},
 	{
 		.procname	= "netdev_max_backlog",
+#ifdef CONFIG_TWEAKS
+		.data		= &netdev_max_backlog,
+		.maxlen		= sizeof(int),
+		.mode       = 0444,
+#else
 		.data		= &net_hotdata.max_backlog,
 		.maxlen		= sizeof(int),
-		.mode		= 0644,
+		.mode       = 0644,
+#endif
 		.proc_handler	= proc_dointvec
 	},
 	{
