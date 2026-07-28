@@ -107,7 +107,7 @@ if [[ $CLEAN -eq 1 ]]; then
     make mrproper
 fi
 
-tool="/home/tew404/kernel_build/llvm19.0.0"
+tool="/home/tew404/kernel_build/gf-clang-23.0.0"
 mkdir -p ~/tmp_build
 export TMPDIR=~/tmp_build
 export PATH=$tool/bin:$PATH
@@ -136,15 +136,16 @@ if [[ "$COMPILER" == "clang" ]]; then
     ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
         KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
         KCONFIG_OVERWRITECONFIG=1 \
-        LLVM=1 LLVM_IAS=1 bindeb-pkg"
+        LLVM=1 LLVM_IAS=1 \
+        bindeb-pkg"
 else
     # การตั้งค่าสำหรับ GCC-13
     unset LLVM
     unset LLVM_IAS
-    export CC=$tool/bin/gcc-13
-    export CXX=$tool/bin/g++-13
-    export HOSTCC=$tool/bin/gcc-13
-    export HOSTCXX=$tool/bin/g++-13
+    export CC=$tool/bin/gcc-
+    export CXX=$tool/bin/g++-
+    export HOSTCC=$tool/bin/gcc-
+    export HOSTCXX=$tool/bin/g++-
     export LD=$tool/bin/ld
     export AR=$tool/bin/ar
     export NM=$tool/bin/nm
@@ -157,7 +158,7 @@ else
 
     ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
         KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
-        KCONFIG_OVERWRITECONFIG=1 \
+        KCONFIG_OVERWRITECONFIG=1 ห\
         bindeb-pkg"
 fi
 
