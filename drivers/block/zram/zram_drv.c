@@ -2930,14 +2930,7 @@ static void zram_reset_device(struct zram *zram)
 #ifdef CONFIG_ZRAM_MULTI_COMP
 	/*
 	 * ต้องยกเลิก + รอ worker ให้จบสนิทก่อนแตะ dev_lock/ปล่อย
-	 * mem_pool/table ข้างล่าง มิฉะนั้นถ้า worker กำลังรันอยู่พอดี
-	 * (ถือ dev_lock read หรือกำลังจะขอ write) แล้วฟังก์ชันนี้ไปเรียก
-	 * zram_meta_free()/zram_destroy_comps() จะเกิด use-after-free
-	 * บน zram->comps[]/zram->table/zram->mem_pool ที่ worker แตะอยู่
-	 * ต้องเรียก "ก่อน" guard(rwsem_write) ด้านล่าง ไม่ใช่หลัง เพราะ
-	 * worker เองก็ต้องขอ dev_lock — ถ้าสลับลำดับจะเสี่ยง deadlock
-	 * (แต่ตรงนี้ปลอดภัยเพราะ cancel_delayed_work_sync ไม่ได้ถือ
-	 * dev_lock เอง แค่รอ worker คืน lock ของมันแล้วจบ)
+	 * mem_pool/table ข้างล่าง...
 	 */
 	cancel_delayed_work_sync(&zram->adapt_work);
 #endif
@@ -2955,25 +2948,7 @@ static void zram_reset_device(struct zram *zram)
 	memset(&zram->stats, 0, sizeof(zram->stats));
 	reset_bdev(zram);
 
-	zram_setup_hardcoded_algorithms(zram);   /* ต้อง setup ใหม่
-						   * ทั้งคู่หลัง reset ไม่งั้น
-						   * secondary comp จะหายไปถาวร
-						   * เพราะ sysfs ปิดแล้ว ไม่มีใคร
-						   * มาตั้งซ้ำให้อีก */
-	/*
-	 * ต้องตั้งขนาดกลับด้วยเช่นกัน — ตอนปิดรูโหว่ที่ disksize_store()
-	 * ยอมรับค่าจาก userspace ได้หลัง reset ไปแล้ว (แก้เป็น pr_warn_once
-	 * + คืน len เฉยๆ ไม่แตะ buf เลย) ทำให้ตอนนี้ "ไม่มีใครเรียก
-	 * zram_set_disksize() อีกเลย" หลัง reset เพราะ disksize_store()
-	 * ไม่ทำหน้าที่นั้นแล้วโดยเจตนา — ถ้าไม่เติมบรรทัดนี้ device จะค้างที่
-	 * disksize=0 ถาวรหลัง reset ครั้งแรก ใช้เป็น swap ต่อไม่ได้อีกเลย
-	 * จนกว่าจะ reboot ทั้งเครื่อง ต้องเรียกในนี้ให้ครบเหมือนที่ทำกับ
-	 * algorithms ด้านบน เพื่อให้ policy "ล็อกจาก userspace แต่ยัง
-	 * ทำงานได้เองภายใน" สมบูรณ์จริง ไม่ใช่แค่ปิดช่องโหว่แล้วพังฟังก์ชัน
-	 */
-	if (zram_set_disksize(zram, zram_compute_hardcoded_disksize()))
-		pr_err("zram%s: failed to re-configure disksize after reset\n",
-		       zram->disk->disk_name);
+	/* ลบการเรียก zram_setup_hardcoded_algorithms() และ zram_set_disksize() ออกจากตรงนี้ทั้งหมด */
 }
 
 static ssize_t disksize_store(struct device *dev, struct device_attribute *attr,
@@ -3038,7 +3013,17 @@ static ssize_t reset_store(struct device *dev,
 
 	/* Make sure all the pending I/O are finished */
 	sync_blockdev(disk->part0);
+	
+	/* 1. เคลียร์ของเก่าทิ้ง */
 	zram_reset_device(zram);
+
+	/* 2. สร้างใหม่เฉพาะตอนที่มีการสั่งผ่าน sysfs reset เท่านั้น */
+	down_write(&zram->dev_lock);
+	zram_setup_hardcoded_algorithms(zram);
+	if (zram_set_disksize(zram, zram_compute_hardcoded_disksize()))
+		pr_err("zram%s: failed to re-configure disksize after reset\n",
+		       zram->disk->disk_name);
+	up_write(&zram->dev_lock);
 
 	mutex_lock(&disk->open_mutex);
 	zram->claim = false;
