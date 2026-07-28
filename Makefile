@@ -920,6 +920,7 @@ endif # may-sync-config
 endif # need-config
 
 KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
+KBUILD_CFLAGS	+= -fno-semantic-interposition
 
 ifdef CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE
 KBUILD_CFLAGS += -O2
@@ -1087,7 +1088,7 @@ export CC_FLAGS_SCS
 endif
 
 ifdef CONFIG_LTO_CLANG
-CC_FLAGS_LTO    := -flto -fvisibility=hidden
+CC_FLAGS_LTO    := -flto=full -fvisibility=hidden
 KBUILD_LDFLAGS += -mllvm -import-instr-limit=5
 endif
 
