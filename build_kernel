@@ -74,6 +74,7 @@
 #watch -n 1 zramctl
 #cat /sys/block/zram0/io_stat
 #sudo dmesg | grep -iE "zram|zcomp|page allocation failure" | tail -n 30
+#sudo dmesg -T | grep -B 20 "zram_add+0x112" | head -30
 
 COMPILER="gcc" # ค่าเริ่มต้น
 CLEAN=0
