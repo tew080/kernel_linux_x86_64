@@ -3634,7 +3634,16 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
 		prio = 90;
 	} else if (S_ISREG(inode->i_mode)) {
 		prio = 10;
-	}
+	} else if (prio < 0) {
+		/*
+		 * กรณี block-device swap ธรรมดา (ไม่ใช่ zram/regfile)
+		 * ที่ผู้ใช้ไม่ได้ระบุ -p เอง ต้องคง auto-decrement เดิมของ
+		 * upstream ไว้ (--least_priority) ไม่งั้น swap device แบบนี้
+		 * หลายตัวจะได้ priority ค่าเดียวกันซ้ำกันหมด แทนที่จะไล่ลดหลั่น
+		 * -1,-2,-3... ตามลำดับ swapon เหมือนพฤติกรรม upstream ปกติ
+		 */
+		prio = --least_priority;
+ 	}
 
 	/*
 	 * The plist prio is negated because plist ordering is
