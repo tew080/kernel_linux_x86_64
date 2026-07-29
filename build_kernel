@@ -36,6 +36,7 @@
 #sysctl net.ipv4.tcp_congestion_control
 
 #cat /sys/devices/system/cpu/cpuidle/current_driver
+#cat /sys/devices/system/cpu/cpuidle/current_governor
 
 #sudo apt purge nvidia-dkms-580-open nvidia-driver-580-open -y
 #sudo apt autoremove -y
