@@ -60,6 +60,17 @@ enum {
 #define ZRAM_ADAPT_BATCH_CRITICAL	2048
 
 /*
+ * PAGES_TO_MB ไม่ใช่ macro มาตรฐานที่ header ใดๆ ที่ include ไว้ด้านบน
+ * (mm.h/kernel.h) รับประกันว่ามีเสมอ — บาง config/เวอร์ชัน kernel อาจไม่มี
+ * ติดมาโดย transitive include ทำให้ build fail ที่บรรทัด
+ * zram_compute_hardcoded_disksize() ด้านล่าง ใส่ guard ด้วย #ifndef กัน
+ * ซ้ำซ้อนกรณี header อื่นเผลอนิยามไว้แล้วจริงๆ
+ */
+#ifndef PAGES_TO_MB
+#define PAGES_TO_MB(pages)	((pages) >> (20 - PAGE_SHIFT))
+#endif
+
+/*
  * ขนาด zram แบบ hardcode ตาม RAM ทั้งหมด ไม่มีทางให้ผู้ใช้ปรับผ่าน
  * sysfs (disksize) ได้อีกต่อไปตามที่ต้องการ — คำนวณตอน zram_add() ทุกครั้ง
  * (รองรับทั้งตอน boot และตอน hot_add เพิ่มอุปกรณ์ระหว่างใช้งาน)
@@ -2620,7 +2631,10 @@ static int recompress_slot(struct zram *zram, u32 index, struct page *page,
  * การตรวจสอบมาแล้วทั้งหมด (scan_slots_for_recompress/recompress_slot/
  * pp_ctl) ไม่ประดิษฐ์ logic บีบอัดใหม่ ลดความเสี่ยงบั๊ก
  *
- * ต้องเรียกภายใต้ zram->dev_lock (write) และ init_done(zram) เป็น true แล้ว
+ * ต้องเรียกภายใต้ zram->dev_lock (ถือ read lock ก็พอ — ฟังก์ชันนี้และ
+ * recompress_slot() แก้ state เฉพาะระดับ slot ผ่าน slot_lock ของตัวเอง
+ * ไม่ได้แตะ field ระดับ device ที่ต้องกัน concurrent write) และ
+ * init_done(zram) เป็น true แล้ว
  */
 static void zram_run_recompress_pass(struct zram *zram, u32 mode, u32 prio,
 				      u64 max_pages)
@@ -2701,7 +2715,21 @@ static void zram_adapt_work_fn(struct work_struct *w)
 		batch = ZRAM_ADAPT_BATCH_CRITICAL;
 	}
 
-	if (down_write_trylock(&zram->dev_lock)) {
+	/*
+	 * ใช้ read lock พอ ไม่ต้อง write lock: I/O path จริง (zram_bio_read/
+	 * zram_bio_write) ไม่แตะ dev_lock เลย ใช้ slot_lock ต่อ slot คุมของ
+	 * มันเองอยู่แล้ว ส่วน comps[]/comp_algs[] ก็ถูกตั้งค่าเฉพาะช่วง
+	 * zram_add()/reset_store() ที่ถือ write lock + cancel_delayed_work_sync()
+	 * กันไม่ให้ worker นี้ทำงานซ้อนอยู่แล้วเสมอ — recompress_slot() เอง
+	 * ก็แก้ state ต่อ slot ผ่าน slot_lock ไม่ใช่ dev_lock เช่นกัน
+	 *
+	 * เปลี่ยนจาก write เป็น read lock ตรงนี้ทำให้ระหว่าง batch ยาวๆ
+	 * (สูงสุด 2048 slot ตอน CRITICAL) sysfs stat readers อื่น (mm_stat,
+	 * stat_io ฯลฯ ที่ถือ read lock) วิ่งขนานไปพร้อมกันได้เลย ไม่ต้องรอ
+	 * ให้ batch จบก่อนเหมือน write lock เดิม — ยังกันชนกับ reset/disksize
+	 * เปลี่ยนแปลง (ที่ต้องใช้ write lock) ได้ครบเหมือนเดิมทุกประการ
+	 */
+	if (down_read_trylock(&zram->dev_lock)) {
 		if (init_done(zram)) {
 			/* เลือก priority สูงสุดที่ admin ตั้งค่าไว้จริง ไม่เกิน
 			 * ที่ tier ต้องการ — กันกรณี admin ตั้ง secondary comp
@@ -2710,7 +2738,7 @@ static void zram_adapt_work_fn(struct work_struct *w)
 				prio--;
 			zram_run_recompress_pass(zram, mode, prio, batch);
 		}
-		up_write(&zram->dev_lock);
+		up_read(&zram->dev_lock);
 	}
 
 out_requeue:
@@ -2971,6 +2999,12 @@ static void zram_reset_device(struct zram *zram)
 	zram_destroy_comps(zram);
 	memset(&zram->stats, 0, sizeof(zram->stats));
 	reset_bdev(zram);
+#ifdef CONFIG_ZRAM_MULTI_COMP
+	/* กันการสแกนรอบแรกหลัง reset เริ่มจากตำแหน่งเดิมกลางดิสก์เก่า
+	 * (ปลอดภัยอยู่แล้วเพราะมี bound check ใน scan_slots_for_recompress
+	 * แต่ล้างให้ตรงไปตรงมาไว้ดีกว่า) */
+	zram->adapt_scan_cursor = 0;
+#endif
 
 	/* ลบการเรียก zram_setup_hardcoded_algorithms() และ zram_set_disksize() ออกจากตรงนี้ทั้งหมด */
 }
@@ -3044,9 +3078,17 @@ static ssize_t reset_store(struct device *dev,
 	/* 2. สร้างใหม่เฉพาะตอนที่มีการสั่งผ่าน sysfs reset เท่านั้น */
 	down_write(&zram->dev_lock);
 	zram_setup_hardcoded_algorithms(zram);
-	if (zram_set_disksize(zram, zram_compute_hardcoded_disksize()))
+	if (zram_set_disksize(zram, zram_compute_hardcoded_disksize())) {
 		pr_err("zram%s: failed to re-configure disksize after reset\n",
 		       zram->disk->disk_name);
+#ifdef CONFIG_ZRAM_MULTI_COMP
+		/* zram_set_disksize() ล้มเหลวก่อนถึงบรรทัด schedule_delayed_work
+		 * ของมันเอง เลย re-arm worker เองตรงนี้ กัน adapt_work ค้าง
+		 * ตายถาวรจนกว่าจะมี reset ครั้งถัดไป (worker จะ no-op ทุก tick
+		 * เพราะ init_done() ยังเป็น false อยู่ ต้นทุนแทบเป็นศูนย์) */
+		schedule_delayed_work(&zram->adapt_work, ZRAM_ADAPT_PERIOD);
+#endif
+	}
 	up_write(&zram->dev_lock);
 
 	mutex_lock(&disk->open_mutex);
