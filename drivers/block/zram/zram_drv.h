@@ -115,6 +115,7 @@ struct zram {
 	struct rw_semaphore dev_lock;
 #ifdef CONFIG_ZRAM_MULTI_COMP
 	struct delayed_work adapt_work;   /* worker ปรับ compression ตาม RAM pressure อัตโนมัติ */
+	unsigned long adapt_scan_cursor;   /* ตำแหน่งสแกนล่าสุด สำหรับ incremental scan */
 #endif
 	/*
 	 * the number of pages zram can consume for storing compressed data

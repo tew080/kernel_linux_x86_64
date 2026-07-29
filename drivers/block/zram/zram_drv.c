@@ -2431,13 +2431,35 @@ static bool highest_priority_algorithm(struct zram *zram, u32 prio)
 	return true;
 }
 
+/*
+ * เดิมสแกนทุก slot ในดิสก์ทั้งก้อนทุกครั้งที่ worker ทำงาน (ทุก 2 วิ
+ * ตราบใดที่ density ไม่ใช่ NORMAL) ต้นทุนสแกนจึงขึ้นกับ disksize ทั้งก้อน
+ * ไม่ใช่ขึ้นกับ batch (256/2048) — บนซีนาริโอเป้าหมาย (เล่นเกม/มัลติทาสก์
+ * ต่อเนื่องหลายชั่วโมง) density จะค้างอยู่ที่ TIGHT/CRITICAL นาน ทำให้
+ * full-scan ระดับล้านๆ slot เกิดซ้ำนับพันครั้งต่อเซสชันโดยไม่จำเป็น
+ *
+ * แก้เป็น incremental scan: สแกนแค่ช่วงจำกัดต่อ tick แล้วจำตำแหน่งล่าสุด
+ * ไว้ (adapt_scan_cursor) วนกลับมาเริ่มใหม่เมื่อครบรอบดิสก์ ต้นทุนต่อ tick
+ * จึงคงที่ไม่ขึ้นกับขนาด zram อีกต่อไป ส่วน batch เดิมยังคุมจำนวนหน้าที่
+ * "บีบอัดจริง" เหมือนเดิมทุกประการ ไม่กระทบ policy อื่นใด
+ */
+#define ZRAM_ADAPT_SCAN_SLOTS_PER_TICK	65536UL   /* ~256MB ต่อ tick */
+
 static void scan_slots_for_recompress(struct zram *zram, u32 mode, u32 prio,
 				      struct zram_pp_ctl *ctl)
 {
 	unsigned long nr_pages = zram->disksize >> PAGE_SHIFT;
-	unsigned long index;
+	unsigned long index, scanned = 0;
+	unsigned long start = zram->adapt_scan_cursor;
 
-	for (index = 0; index < nr_pages; index++) {
+	if (!nr_pages)
+		return;
+	if (start >= nr_pages)
+		start = 0;
+
+	for (index = start;
+	     scanned < nr_pages && scanned < ZRAM_ADAPT_SCAN_SLOTS_PER_TICK;
+	     scanned++, index = (index + 1) % nr_pages) {
 		bool ok = true;
 
 		/*
@@ -2474,6 +2496,8 @@ next:
 		if (!ok)
 			break;
 	}
+	/* จำตำแหน่งถัดไปไว้ tick หน้า ไม่ต้องเริ่มจาก index 0 ใหม่ทุกครั้ง */
+	zram->adapt_scan_cursor = index;
 }
 
 /*
