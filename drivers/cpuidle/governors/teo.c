@@ -107,6 +107,12 @@
 #include <linux/sched/clock.h>
 #include <linux/tick.h>
 
+#include <linux/power_supply.h>   /* power_supply_is_system_supplied() */
+#include <linux/notifier.h>
+#include <linux/atomic.h>
+#ifdef CONFIG_DEBUGFS          
+#include <linux/debugfs.h>
+#endif
 #include "gov.h"
 
 /*
@@ -153,6 +159,69 @@ struct teo_cpu {
 };
 
 static DEFINE_PER_CPU(struct teo_cpu, teo_cpus);
+#ifdef CONFIG_DEBUGFS    
+static atomic64_t teo_bias_perf_count;   /* bias = -1 (max performance) */
+static atomic64_t teo_bias_none_count;   /* bias =  0 (balance) */
+static atomic64_t teo_bias_save_count;   /* bias = +1 (powersave) */
+#endif
+/*
+ * เดิมใช้ jiffies-based polling เรียก power_supply_is_system_supplied()
+ * จาก teo_select() ซึ่งรันใน idle path โดย local IRQ ปิดอยู่แล้ว
+ * (do_idle() เรียก local_irq_disable() ก่อน cpuidle_idle_call() เสมอ)
+ * — การ cache ลดความถี่ได้ แต่ไม่ได้แก้ปัญหาจริง เพราะฟังก์ชันนั้นล็อก
+ * mutex ภายใน แค่เรียกครั้งเดียวใน context นี้ก็ผิดกฎแล้ว (จะโดน
+ * "BUG: scheduling while atomic" หรือแย่กว่านั้นถ้าไม่มี
+ * CONFIG_DEBUG_ATOMIC_SLEEP คอยจับ)
+ *
+ * เปลี่ยนมาใช้ power_supply notifier แทน — callback รันผ่าน
+ * blocking_notifier_call_chain จาก power_supply_changed_work() ซึ่งเป็น
+ * workqueue/process context ปลอดภัยที่จะ mutex_lock() เต็มที่ ผลคือใน
+ * hot path (teo_depth_bias) เหลือแค่ atomic_read() ล้วนๆ ไม่มี jiffies,
+ * ไม่มี cmpxchg, ไม่มีความเสี่ยง panic อีกต่อไป และตอบสนองไวกว่าเดิมด้วย
+ * (event-driven ทันทีที่ปลั๊กเปลี่ยน แทนที่จะรอ cache หมดอายุ 1 วิ)
+ */
+static atomic_t teo_on_ac = ATOMIC_INIT(1);
+
+static int teo_power_supply_callback(struct notifier_block *nb,
+				     unsigned long event, void *data)
+{
+	atomic_set(&teo_on_ac, power_supply_is_system_supplied() != 0);
+	return NOTIFY_OK;
+}
+
+static struct notifier_block teo_power_supply_notifier = {
+	.notifier_call = teo_power_supply_callback,
+};
+
+static int teo_depth_bias(struct teo_cpu *cpu_data)
+{
+	bool on_ac = atomic_read(&teo_on_ac);
+	bool heavy = 2 * cpu_data->short_idles >= cpu_data->total;
+	int bias = on_ac ? (heavy ? -1 : 0) : (heavy ? 0 : 1);
+
+#ifdef CONFIG_DEBUGFS    
+	if (bias < 0)
+		atomic64_inc(&teo_bias_perf_count);
+	else if (bias > 0)
+		atomic64_inc(&teo_bias_save_count);
+	else
+		atomic64_inc(&teo_bias_none_count);
+#endif
+	return bias;
+}
+
+static int teo_step_state(struct cpuidle_driver *drv, struct cpuidle_device *dev,
+			  int idx, int step, int lo, int hi)
+{
+	int i = idx + step;
+
+	while (i >= lo && i <= hi) {
+		if (!dev->states_usage[i].disable)
+			return i;
+		i += step;
+	}
+	return idx;
+}
 
 static void teo_decay(unsigned int *metric)
 {
@@ -434,6 +503,25 @@ static int teo_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		idx = constraint_idx;
 
 	/*
+	 * Bias ตามไฟ/โหลด — ขยับได้สูงสุด 1 level เท่านั้น และยัง
+	 * ถูก clamp อยู่ใน [idx0, constraint_idx] เสมอ ดังนั้นไม่มีทาง
+	 * ละเมิด PM QoS latency constraint หรือหลุดออกจาก enabled states
+	 * ที่วางไว้ก่อนหน้านี้เลย วางไว้ "ก่อน" ตรรกะเรื่อง sleep-length/
+	 * timer ด้านล่างโดยตั้งใจ — เพื่อให้กลไกป้องกันการนอนเลย timer
+	 * (teo_find_shallower_state ที่เรียกท้ายฟังก์ชัน) ยังทำงานทับ
+	 * ผลจาก bias ได้เสมอถ้าจำเป็น bias จึงเป็นแค่ "จุดเริ่มต้นที่เอนเอียง
+	 * ไว้ก่อน" ไม่ใช่การปิดกลไกความถูกต้องเดิมของ TEO เลย
+	 */
+	{
+		int bias = teo_depth_bias(cpu_data);
+
+		if (bias < 0)
+			idx = teo_step_state(drv, dev, idx, -1, idx0, constraint_idx);
+		else if (bias > 0)
+			idx = teo_step_state(drv, dev, idx, 1, idx0, constraint_idx);
+	}
+
+	/*
 	 * If the tick has not been stopped and either the candidate state is
 	 * state 0 or its target residency is low enough, there is basically
 	 * nothing more to do, but if the sleep length is not updated, the
@@ -560,7 +648,30 @@ static int teo_enable_device(struct cpuidle_driver *drv,
 
 	return 0;
 }
+#ifdef CONFIG_DEBUGFS    
+static struct dentry *teo_debugfs_dir;
 
+static int teo_bias_perf_get(void *data, u64 *val)
+{
+	*val = atomic64_read(&teo_bias_perf_count);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(teo_bias_perf_fops, teo_bias_perf_get, NULL, "%llu\n");
+
+static int teo_bias_none_get(void *data, u64 *val)
+{
+	*val = atomic64_read(&teo_bias_none_count);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(teo_bias_none_fops, teo_bias_none_get, NULL, "%llu\n");
+
+static int teo_bias_save_get(void *data, u64 *val)
+{
+	*val = atomic64_read(&teo_bias_save_count);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(teo_bias_save_fops, teo_bias_save_get, NULL, "%llu\n");
+#endif
 static struct cpuidle_governor teo_governor = {
 	.name =		"teo",
 	.rating =	20,
@@ -571,6 +682,32 @@ static struct cpuidle_governor teo_governor = {
 
 static int __init teo_governor_init(void)
 {
+	int ret, supplied;
+
+	/*
+	 * seed ค่าเริ่มต้นแบบ synchronous ได้อย่างปลอดภัยตรงนี้ เพราะ
+	 * __init รันใน process context ปกติ (ไม่ใช่ idle/atomic path)
+	 * จากนั้น notifier ด้านบนจะอัปเดตให้เองทุกครั้งที่ปลั๊กเปลี่ยน
+	 */
+	supplied = power_supply_is_system_supplied();
+	atomic_set(&teo_on_ac, supplied < 0 ? 1 : supplied);
+
+	ret = power_supply_reg_notifier(&teo_power_supply_notifier);
+	if (ret)
+		pr_warn("teo: failed to register power_supply notifier (%d); "
+			"AC/battery bias will stay fixed at boot-time value\n",
+			ret);
+#ifdef CONFIG_DEBUGFS    
+	teo_debugfs_dir = debugfs_create_dir("teo_bias", NULL);
+	if (!IS_ERR_OR_NULL(teo_debugfs_dir)) {
+		debugfs_create_file_unsafe("performance", 0444, teo_debugfs_dir,
+					    NULL, &teo_bias_perf_fops);
+		debugfs_create_file_unsafe("balanced", 0444, teo_debugfs_dir,
+					    NULL, &teo_bias_none_fops);
+		debugfs_create_file_unsafe("powersave", 0444, teo_debugfs_dir,
+					    NULL, &teo_bias_save_fops);
+	}
+#endif
 	return cpuidle_register_governor(&teo_governor);
 }
 
