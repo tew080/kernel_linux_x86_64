@@ -54,6 +54,7 @@
 #include <linux/delayacct.h>
 #include <linux/cacheinfo.h>
 #include <linux/pgalloc_tag.h>
+#include <linux/sched/loadavg.h>
 #include <asm/div64.h>
 #include "internal.h"
 #include "shuffle.h"
@@ -286,6 +287,36 @@ unsigned int nr_online_nodes __read_mostly = 1;
 EXPORT_SYMBOL(nr_node_ids);
 EXPORT_SYMBOL(nr_online_nodes);
 #endif
+
+
+/*
+ * watermark_scale_factor ปรับอัตโนมัติตาม RAM ทั้งเครื่อง —
+ * ไม่ใช้ hot path เลย (แค่ตอน boot/min_free_kbytes เปลี่ยน/hotplug)
+ * เครื่อง RAM เยอะ ให้ kswapd reclaim เป็นก้อนใหญ่ขึ้นต่อครั้ง แลกกับ
+ * wake ถี่น้อยลง (ลด CPU overhead จากการ wake บ่อยๆ โดยไม่จำเป็น)
+ * เครื่อง RAM น้อย คงค่าเดิม (10) ไว้เน้นตอบสนองไว กัน OOM
+ */
+static const struct {
+	unsigned long min_megs;
+	int scale;
+} watermark_scale_tiers[] = {
+	{ 65536, 50 },	/* RAM >= 64GB */
+	{ 16384, 30 },	/* RAM >= 16GB */
+	{  4096, 20 },	/* RAM >= 4GB  */
+	{     0, 10 },	/* ต่ำกว่า 4GB — ค่าเดิม ไม่เปลี่ยน */
+};
+
+static int watermark_compute_scale_factor(void)
+{
+	unsigned long megs = totalram_pages() >> (20 - PAGE_SHIFT);
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(watermark_scale_tiers); i++) {
+		if (megs >= watermark_scale_tiers[i].min_megs)
+			return watermark_scale_tiers[i].scale;
+	}
+	return 10;
+}
 
 static bool page_contains_unaccepted(struct page *page, unsigned int order);
 static bool cond_accept_memory(struct zone *zone, unsigned int order,
@@ -2159,20 +2190,77 @@ bool pageblock_unisolate_and_move_free_pages(struct zone *zone, struct page *pag
 
 #endif /* CONFIG_MEMORY_ISOLATION */
 
+#define WATERMARK_BOOST_POLL_INTERVAL	HZ
+
+static atomic_long_t watermark_boost_last_poll;
+
+/*
+ * watermark_boost_factor ปรับตาม CPU load ปัจจุบันแบบ rate-limit
+ * ต่างจาก watermark_scale_factor เพราะ boost_watermark() ถูกเรียกตอน
+ * pageblock fallback event จริง (ถี่ขึ้นเรื่อยๆ ตามความรุนแรงของ
+ * fragmentation ระหว่างระบบทำงานหนัก) — ต้อง rate-limit การอ่าน loadavg
+ * เพื่อไม่ให้ต้นทุนเพิ่มตาม event rate โดยไม่จำเป็น (แนวเดียวกับ
+ * sysctl_compaction_proactiveness ที่ทำไว้ก่อนหน้า)
+ *
+ * ตอนระบบว่าง: boost เต็มที่ (ลด fragmentation ให้มากที่สุดเท่าที่ทำได้
+ * เพราะ background work "ฟรี" ตอนไม่มีอะไรแย่ง cycle)
+ * ตอนระบบหนัก (เกม/compile/multitask): ลด boost ceiling ลง เพื่อไม่ให้
+ * kswapd ทำงานหนักเกินจำเป็นจนแย่ง cache/cycle จาก foreground workload
+ */
+static void watermark_update_dynamic_boost(void)
+{
+	unsigned long now = jiffies;
+	unsigned long last = atomic_long_read(&watermark_boost_last_poll);
+	unsigned long load;
+	unsigned int ncpu, boost;
+
+	if (likely(time_before(now, last + WATERMARK_BOOST_POLL_INTERVAL)))
+		return;
+	if (atomic_long_cmpxchg(&watermark_boost_last_poll, last, now) != last)
+		return;
+
+	load = avenrun[0] >> FSHIFT;
+	ncpu = num_online_cpus();
+
+	if (2 * load < ncpu)
+		boost = 15000;	/* ว่าง: boost เต็มที่ */
+	else if (load < ncpu)
+		boost = 7000;	/* กลางๆ */
+	else
+		boost = 2000;	/* หนักจริง: boost แค่พอกันพัง ไม่แย่ง cycle */
+
+	WRITE_ONCE(watermark_boost_factor, boost);
+}
+
 static inline bool boost_watermark(struct zone *zone)
 {
 	unsigned long max_boost;
+	unsigned long managed = zone_managed_pages(zone);
+
+	watermark_update_dynamic_boost();
 
 	if (!watermark_boost_factor)
 		return false;
-	/*
-	 * Don't bother in zones that are unlikely to produce results.
-	 * On small machines, including kdump capture kernels running
-	 * in a small area, boosting the watermark can cause an out of
-	 * memory situation immediately.
-	 */
-	if ((pageblock_nr_pages * 4) > zone_managed_pages(zone))
+
+	if ((pageblock_nr_pages * 4) > managed)
 		return false;
+
+	/*
+	 * ถ้า free pages เหลือเยอะกว่า high watermark มาก
+	 * (>6.25% ของ zone) และยังมี block ขนาด pageblock_order ว่างอยู่จริง
+	 * ไม่ว่า migratetype ไหน — fragmentation ยังไม่วิกฤต ข้าม boost ไป
+	 * เลย ลด reclaim ที่ไม่จำเป็น ประหยัด CPU และเก็บ page cache ไว้ได้
+	 * มากขึ้น เสริมกับ dynamic ceiling ด้านบน (คนละแกน ไม่ชนกัน)
+	 */
+	if (zone_page_state(zone, NR_FREE_PAGES) >
+	    high_wmark_pages(zone) + (managed >> 4)) {
+		struct free_area *area = &zone->free_area[pageblock_order];
+
+		if (!list_empty(&area->free_list[MIGRATE_MOVABLE]) ||
+		    !list_empty(&area->free_list[MIGRATE_UNMOVABLE]) ||
+		    !list_empty(&area->free_list[MIGRATE_RECLAIMABLE]))
+			return false;
+	}
 
 	max_boost = mult_frac(zone->_watermark[WMARK_HIGH],
 			watermark_boost_factor, 10000);
@@ -6375,6 +6463,14 @@ static void __setup_per_zone_wmarks(void)
 	unsigned long lowmem_pages = 0;
 	struct zone *zone;
 	unsigned long flags;
+
+	/*
+	 * คำนวณ tier ใหม่ทุกครั้งที่ฟังก์ชันนี้ถูกเรียก — idempotent
+	 * และถูกที่สุดพอดี เพราะ trigger ของฟังก์ชันนี้ (boot/min_free_kbytes
+	 * เปลี่ยน/hotplug) คือจังหวะเดียวกับที่ "RAM ทั้งเครื่อง" อาจเปลี่ยน
+	 * ไปพอดี (โดยเฉพาะ hotplug) ไม่ต้อง cache แยกเพิ่ม
+	 */
+	WRITE_ONCE(watermark_scale_factor, watermark_compute_scale_factor());
 
 	/* Calculate total number of !ZONE_HIGHMEM and !ZONE_MOVABLE pages */
 	for_each_zone(zone) {
