@@ -32,6 +32,8 @@
 #include <linux/bit_spinlock.h>
 #include <linux/rculist_bl.h>
 #include <linux/list_lru.h>
+#include <linux/jiffies.h>
+#include <linux/atomic.h>
 #include "internal.h"
 #include "mount.h"
 
@@ -81,9 +83,64 @@ static int sysctl_vfs_cache_pressure __read_mostly = 100;
 static int sysctl_vfs_cache_pressure_denom __read_mostly = 100;
 #endif
 
+
+/*
+ * dcache-adaptive-pressure-floor
+ *
+ * ภายใต้ CONFIG_TWEAKS ทั้ง sysctl_vfs_cache_pressure และ _denom ถูกล็อกเป็น
+ * 0444 (read-only) ในตาราง sysctl ด้านล่าง — แอดมินปรับเองไม่ได้เลยตลอด
+ * เวลาที่ค่าตายตัว 50/100 (reclaim dcache/icache ช้ากว่า pagecache 2 เท่า
+ * เสมอ) ดีต่อ workload ที่ใช้ไฟล์เยอะ (compile, IDE indexing, เบราว์เซอร์
+ * แคชไฟล์) เพราะ path lookup ยังไวอยู่ แต่ "ไม่มี escape hatch" เลยถ้า RAM
+ * วิกฤตจริงจากการเปิดหลายโปรแกรมพร้อมกันต่อเนื่อง — เอกสารของ kernel เอง
+ * ก็เตือนไว้ตรงๆ ว่า pressure ต่ำเกินไปสามารถนำไปสู่ OOM ได้ง่าย
+ *
+ * แก้โดยเติม safety floor: ถ้า RAM เหลือน้อยกว่าระดับวิกฤตจริง (<10%,
+ * เกณฑ์เดียวกับ ZRAM_DENSITY_CRITICAL ที่ใช้ทั่วทั้งชุดนี้) บังคับให้
+ * อัตราส่วน reclaim ของ dcache/icache ไม่ต่ำกว่า neutral (เท่า pagecache)
+ * ชั่วคราว โดยไม่แตะค่าที่ตั้งไว้เลย (sysctl ยังอ่านได้ 50/100 เหมือนเดิม
+ * เสมอ ไม่โกหกแอดมิน) เป็นแค่ค่าที่ "ใช้จริง" ตอนคำนวณเท่านั้น — ไม่มีทาง
+ * reclaim aggressive กว่า neutral (ไม่ punish dcache/icache เกินจำเป็น)
+ * แค่เลิกปกป้องพิเศษตอนใกล้ OOM จริงๆ เท่านั้น
+ */
+#define DCACHE_CRITICAL_MEM_PCT		10U
+#define DCACHE_PRESSURE_UPDATE_INTERVAL	(HZ / 2)
+
+static atomic_t dcache_mem_critical = ATOMIC_INIT(0);
+static unsigned long dcache_pressure_next_update;
+
+static void dcache_update_mem_state(void)
+{
+	unsigned long now = jiffies;
+	unsigned long total, avail, pct;
+
+	if (time_before(now, dcache_pressure_next_update))
+		return;
+	dcache_pressure_next_update = now + DCACHE_PRESSURE_UPDATE_INTERVAL;
+
+	total = totalram_pages();
+	if (!total) {
+		atomic_set(&dcache_mem_critical, 0);
+		return;
+	}
+
+	avail = si_mem_available();
+	pct = avail * 100 / total;
+
+	atomic_set(&dcache_mem_critical, pct < DCACHE_CRITICAL_MEM_PCT);
+}
+
 unsigned long vfs_pressure_ratio(unsigned long val)
 {
-	return mult_frac(val, sysctl_vfs_cache_pressure, sysctl_vfs_cache_pressure_denom);
+	int pressure = READ_ONCE(sysctl_vfs_cache_pressure);
+	int denom = READ_ONCE(sysctl_vfs_cache_pressure_denom);
+
+	dcache_update_mem_state();
+
+	if (atomic_read(&dcache_mem_critical) && pressure < denom)
+		pressure = denom;
+
+	return mult_frac(val, pressure, denom);
 }
 EXPORT_SYMBOL_GPL(vfs_pressure_ratio);
 
