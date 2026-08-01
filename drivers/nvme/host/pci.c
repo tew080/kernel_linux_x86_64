@@ -105,13 +105,8 @@ static const struct kernel_param_ops io_queue_depth_ops = {
 	.get = param_get_uint,
 };
 
-#ifdef CONFIG_TWEAKS
-static unsigned int io_queue_depth = 257;
-module_param_cb(io_queue_depth, &io_queue_depth_ops, &io_queue_depth, 0444);
-#else
 static unsigned int io_queue_depth = 1024;
 module_param_cb(io_queue_depth, &io_queue_depth_ops, &io_queue_depth, 0644);
-#endif
 MODULE_PARM_DESC(io_queue_depth, "set io queue depth, should >= 2 and < 4096");
 
 
@@ -268,24 +263,14 @@ static const struct kernel_param_ops io_queue_count_ops = {
 	.get = param_get_uint,
 };
 
-#ifdef CONFIG_TWEAKS
-static unsigned int write_queues = 2;
-module_param_cb(write_queues, &io_queue_count_ops, &write_queues, 0444);
-#else
 static unsigned int write_queues;
 module_param_cb(write_queues, &io_queue_count_ops, &write_queues, 0644);
-#endif
 MODULE_PARM_DESC(write_queues,
 	"Number of queues to use for writes. If not set, reads and writes "
 	"will share a queue set.");
 
-#ifdef CONFIG_TWEAKS
-static unsigned int poll_queues = 4;
-module_param_cb(poll_queues, &io_queue_count_ops, &poll_queues, 0444);
-#else
 static unsigned int poll_queues;
 module_param_cb(poll_queues, &io_queue_count_ops, &poll_queues, 0644);
-#endif
 MODULE_PARM_DESC(poll_queues, "Number of queues to use for polled IO.");
 
 static bool noacpi;

@@ -81,11 +81,8 @@ static int dirty_background_ratio = 10;
  * dirty_background_bytes starts at 0 (disabled) so that it is a function of
  * dirty_background_ratio * the amount of dirtyable memory
  */
-#ifdef CONFIG_TWEAKS
-static unsigned long dirty_background_bytes = 67108864; /* 64MB */
-#else
 static unsigned long dirty_background_bytes;
-#endif
+
 /*
  * free highmem will not be subtracted from the total free memory
  * for calculating free ratios if vm_highmem_is_dirtyable is true
@@ -105,11 +102,8 @@ static int vm_dirty_ratio = 20;
  * vm_dirty_bytes starts at 0 (disabled) so that it is a function of
  * vm_dirty_ratio * the amount of dirtyable memory
  */
-#ifdef CONFIG_TWEAKS
-static unsigned long vm_dirty_bytes = 268435456; /* 256MB */
-#else
 static unsigned long vm_dirty_bytes;
-#endif
+
 /*
  * The interval between `kupdate'-style writebacks
  */
@@ -2270,11 +2264,7 @@ static const struct ctl_table vm_page_writeback_sysctls[] = {
 		.procname   = "dirty_background_bytes",
 		.data       = &dirty_background_bytes,
 		.maxlen     = sizeof(dirty_background_bytes),
-#ifdef CONFIG_TWEAKS
-		.mode       = 0444,
-#else
 		.mode       = 0644,
-#endif
 		.proc_handler   = dirty_background_bytes_handler,
 		.extra1     = SYSCTL_LONG_ONE,
 	},
@@ -2295,11 +2285,7 @@ static const struct ctl_table vm_page_writeback_sysctls[] = {
 		.procname   = "dirty_bytes",
 		.data       = &vm_dirty_bytes,
 		.maxlen     = sizeof(vm_dirty_bytes),
-#ifdef CONFIG_TWEAKS
-		.mode       = 0444,
-#else
 		.mode       = 0644,
-#endif
 		.proc_handler   = dirty_bytes_handler,
 		.extra1     = (void *)&dirty_bytes_min,
 	},
