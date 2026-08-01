@@ -13,6 +13,7 @@
 #include <linux/migrate.h>
 #include <linux/compaction.h>
 #include <linux/mm_inline.h>
+#include <linux/sched/loadavg.h>
 #include <linux/sched/signal.h>
 #include <linux/backing-dev.h>
 #include <linux/sysctl.h>
@@ -24,6 +25,7 @@
 #include <linux/page_owner.h>
 #include <linux/psi.h>
 #include <linux/cpuset.h>
+#include <linux/jiffies.h>
 #include "internal.h"
 
 #ifdef CONFIG_COMPACTION
@@ -1907,6 +1909,72 @@ static unsigned int __read_mostly sysctl_compaction_proactiveness = 20;
 static int sysctl_extfrag_threshold = 500;
 static int __read_mostly sysctl_compact_memory;
 
+/*
+ * compaction-adaptive-proactiveness
+ *
+ * ขอบเขตที่ตัดสินใจ "ทำให้ฉลาด": ปรับเฉพาะ sysctl_compaction_proactiveness
+ * เป็นค่าไดนามิกรอบ baseline ที่ผู้ใช้ตั้งไว้ ตามภาระงานปัจจุบันของระบบ —
+ * ระบบว่าง (load เบา) ให้ compaction เชิงรุกทำงานถี่ขึ้นกว่าที่ตั้งไว้
+ * เล็กน้อย (ตอนนี้มีรอบว่างให้ใช้ ทำล่วงหน้าไว้ถูกกว่ามาทำตอน alloc พลาด)
+ * ส่วนตอนระบบโหลดหนัก (เช่นกำลัง compile/เล่นเกม) ให้ผ่อนลงครึ่งหนึ่ง
+ * ไม่ให้ไปแย่ง CPU/memory-bandwidth จาก foreground workload — ตรงเป้าหมาย
+ * "responsive ต่อ pressure + รับโหลดหนักได้ดี" โดยไม่ทำให้ compaction
+ * หายไปเฉยๆ (แค่ผ่อน ไม่ปิด)
+ *
+ * sysctl_extfrag_threshold และ sysctl_compact_memory จงใจ "ไม่" ทำให้เป็น
+ * ไดนามิกด้วยเหตุผลคนละแบบ:
+ *  - extfrag_threshold กำหนดว่าความล้มเหลวของ high-order alloc เกิดจาก
+ *    fragmentation หรือ low-memory จริง ซึ่งไปกระทบเส้นทาง reclaim/OOM
+ *    โดยตรง การขยับค่านี้แบบ runtime จะทำให้พฤติกรรมการตัดสินใจ
+ *    OOM-vs-compact ไม่คงเส้นคงวา คาดเดายาก เสี่ยงกว่าประโยชน์ที่ได้มาก
+ *    เก็บเป็นค่าที่ผู้ดูแลระบบตั้งเองแบบตรงไปตรงมาดีกว่า
+ *  - compact_memory เป็นปุ่ม trigger ครั้งเดียวสำหรับแอดมิน/สคริปต์สั่ง
+ *    บีบอัดหน่วยความจำทันที (เช่นก่อนเข้าช่วง maintenance) ความ "ฉลาด"
+ *    แบบอัตโนมัติมีอยู่แล้วในกลไก proactive compaction ของ kcompactd
+ *    ถ้าทำให้ trigger นี้ฉลาดขึ้นเอง จะขัดกับเจตนาของมันที่ต้องพึ่งพาได้
+ *    และคาดเดาผลได้แน่นอนเมื่อแอดมินสั่งเอง
+ */
+#define COMPACTION_LOAD_UPDATE_INTERVAL	(HZ / 2)
+
+static atomic_t compaction_load_heavy = ATOMIC_INIT(0);
+static unsigned long compaction_load_next_update;
+
+static void compaction_update_load(void)
+{
+	unsigned long now = jiffies;
+
+	if (time_before(now, compaction_load_next_update))
+		return;
+	/*
+	 * เขียนซ้ำได้จากหลาย CPU/หลาย node พร้อมกันอย่างปลอดภัย — เป็นแค่
+	 * atomic_set() ค่าที่คำนวณใหม่ทั้งหมดเสมอ ไม่มี read-modify-write
+	 * เลยไม่มีทาง corrupt ต่อให้แข่งกันอัปเดตในหน้าต่างเดียวกันหลายรอบ
+	 */
+	compaction_load_next_update = now + COMPACTION_LOAD_UPDATE_INTERVAL;
+	atomic_set(&compaction_load_heavy, avenrun[0] > (num_online_cpus() << FSHIFT));
+}
+
+/*
+ * คืนค่า proactiveness ที่ "จะใช้จริง" ในการคำนวณ watermark เท่านั้น —
+ * ไม่เคยเขียนทับ sysctl_compaction_proactiveness เอง (ผู้ใช้ยังอ่านค่าที่
+ * ตัวเองตั้งไว้ผ่าน sysctl ได้ตรงไปตรงมาเสมอ ไม่ถูก "โกหก" จากการปรับภายใน)
+ * และเคารพสวิตช์ปิด/เปิดหลัก (0 = ปิด) อย่างเคร่งครัด ไม่มีทางเปิดเองได้
+ */
+static unsigned int compaction_effective_proactiveness(void)
+{
+	unsigned int base = sysctl_compaction_proactiveness;
+
+	if (!base)
+		return 0;
+
+	compaction_update_load();
+
+	if (atomic_read(&compaction_load_heavy))
+		return max(base / 2, 1U);
+
+	return min(base + base / 4, 100U);
+}
+
 static inline void
 update_fast_start_pfn(struct compact_control *cc, unsigned long pfn)
 {
@@ -2231,7 +2299,7 @@ static unsigned int fragmentation_score_wmark(bool low)
 {
 	unsigned int wmark_low, leeway;
 
-	wmark_low = 100U - sysctl_compaction_proactiveness;
+	wmark_low = 100U - compaction_effective_proactiveness();
 	leeway = min(10U, wmark_low / 2);
 	return low ? wmark_low : min(wmark_low + leeway, 100U);
 }
