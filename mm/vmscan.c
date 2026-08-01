@@ -4140,10 +4140,43 @@ static unsigned long lru_gen_min_ttl __read_mostly = 5 * HZ; // 5000ms
 static unsigned long lru_gen_min_ttl __read_mostly;
 #endif
 
+/*
+ * lru-gen-adaptive-min-ttl
+ *
+ * min_ttl ที่ตั้งไว้แบบ hardcode คงที่เป็นดาบสองคม: ป้องกัน thrashing ได้ดี
+ * ตอนโหลดเบา-กลาง แต่ตอนเปิดหลายแอปพร้อมกันเป็นชุดใหญ่ (multitasking หนัก)
+ * generation ใหม่ของทุก memcg จะ "อายุน้อย" พร้อมกันหมด ทำให้เข้าเงื่อนไข
+ * "ไม่มีอะไร reclaim ได้" ทั้งที่จริงมีเยอะแยะที่ reclaim/swap ได้ แค่ยัง
+ * ไม่ถึงอายุที่กำหนด — เสี่ยง OOM-kill โดยไม่จำเป็นในสถานการณ์ที่ควรรองรับ
+ * ให้ดีที่สุดพอดี (หลายงานพร้อมกันต่อเนื่อง)
+ *
+ * แก้โดยลดสัดส่วนการคุ้มครองลงตาม sc->priority ซึ่งเป็นสัญญาณความรุนแรง
+ * ของแรงกดดันที่มีอยู่แล้วในเส้นทาง reclaim (ลดจาก DEF_PRIORITY ทุกครั้งที่
+ * รอบก่อนหน้า reclaim ไม่พอ จนถึง 0 ตอนใกล้ OOM จริง) ไม่ต้องเพิ่ม state,
+ * lock, หรือ timer ใดๆ เลย — priority สูง (แรงกดดันยังเบา) คุ้มครองเต็มที่
+ * ตามค่าที่ตั้งไว้ ยิ่ง priority ต่ำ (ลองมาหลายรอบแล้วไม่พอ) ยิ่งผ่อนลง
+ * เป็นสัดส่วนเชิงเส้น จนเหลือ 0 พอดีที่ priority ต่ำสุด — รับประกันว่า
+ * reclaim/swap จะได้โอกาสทำงานเต็มที่ก่อนตัดสินใจ OOM-kill เสมอ ไม่ปล่อย
+ * ให้ฟีเจอร์นี้เป็นเหตุผลที่ OOM ทำงานทั้งที่ยังมีทางไปอื่น
+ *
+ * เคารพสวิตช์ปิด (min_ttl_ms = 0) อย่างเคร่งครัด — ปิดแล้วคือ 0 เสมอ
+ * ไม่มีทางถูกฟังก์ชันนี้เปิดเองได้ และเป็นแค่การคูณ/หารเลขจำนวนเต็ม
+ * ธรรมดา ไม่มี branch พิเศษที่กระทบ low-latency ของเส้นทาง kswapd เลย
+ */
+static unsigned long lru_gen_effective_min_ttl(struct scan_control *sc)
+{
+	unsigned long min_ttl = READ_ONCE(lru_gen_min_ttl);
+
+	if (!min_ttl)
+		return 0;
+
+	return min_ttl * sc->priority / DEF_PRIORITY;
+}
+
 static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 {
 	struct mem_cgroup *memcg;
-	unsigned long min_ttl = READ_ONCE(lru_gen_min_ttl);
+	unsigned long min_ttl = lru_gen_effective_min_ttl(sc);
 	bool reclaimable = !min_ttl;
 
 	VM_WARN_ON_ONCE(!current_is_kswapd());
