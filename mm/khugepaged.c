@@ -4,6 +4,9 @@
 #include <linux/mm.h>
 #include <linux/sched.h>
 #include <linux/sched/mm.h>
+#include <linux/sched/loadavg.h>
+#include <linux/jiffies.h>
+#include <linux/atomic.h>
 #include <linux/mmu_notifier.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
@@ -80,6 +83,58 @@ static unsigned int khugepaged_scan_sleep_millisecs __read_mostly = 10000;
 /* during fragmentation poll the hugepage allocator once every minute */
 static unsigned int khugepaged_alloc_sleep_millisecs __read_mostly = 60000;
 static unsigned long khugepaged_sleep_expire;
+
+/*
+ * DOC: khugepaged-adaptive-sleep
+ *
+ * scan_sleep_millisecs (10s) และ alloc_sleep_millisecs (60s) เป็นค่าคงที่
+ * ควบคุมว่า background thread รวมหน้า 4K เป็น THP ถี่แค่ไหน — เหมือน
+ * compaction_proactiveness เป๊ะ (ทั้งคู่คือ "จังหวะงาน background ที่
+ * แลกกับ CPU/memory-bandwidth ของ foreground") ใช้เทคนิคเดียวกัน (avenrun
+ * load average, rate-limited) เพื่อความสอดคล้องกันทั้งชุด — ไม่ใช้
+ * nr_running() เพราะเจอปัญหา undeclared function ตอนแก้ compaction.c
+ * มาแล้ว (ไม่ export ให้ไฟล์นอก kernel/sched/ ในเคอร์เนลรุ่นนี้)
+ *
+ * ระบบว่าง (load เบา) → ลด sleep ลง 25% สแกน/ลองอัลโลเคตถี่ขึ้น ใช้รอบว่าง
+ * สร้าง THP ล่วงหน้าไว้ตอนที่ทำได้ถูกที่สุด
+ * ระบบหนัก (compile/เกม) → ยืด sleep ออก 50% ไม่ไปแย่ง CPU/memory-bandwidth
+ * จาก foreground workload
+ *
+ * เคารพ 0 (ปิดฟีเจอร์ผ่าน sysfs) เสมอ — คืน 0 ทันทีไม่มีทางเปิดเอง
+ * เป็นแค่เลขคณิตล้วนๆ ไม่มี lock/allocation เพิ่ม เรียกแค่ตอนจะเข้านอน
+ * (ไม่ใช่ hot path) จึง rate-limit แบบเดียวกับ compaction ก็เกินพอแล้ว
+ */
+#define KHUGEPAGED_LOAD_UPDATE_INTERVAL	(HZ / 2)
+
+static atomic_t khugepaged_load_heavy = ATOMIC_INIT(0);
+static unsigned long khugepaged_load_next_update;
+
+static void khugepaged_update_load(void)
+{
+	unsigned long now = jiffies;
+	unsigned long load1min;
+
+	if (time_before(now, khugepaged_load_next_update))
+		return;
+	khugepaged_load_next_update = now + KHUGEPAGED_LOAD_UPDATE_INTERVAL;
+
+	load1min = avenrun[0] >> FSHIFT;
+	atomic_set(&khugepaged_load_heavy, load1min >= num_online_cpus());
+}
+
+static unsigned int khugepaged_scale_sleep_msecs(unsigned int msecs)
+{
+	if (!msecs)
+		return 0;
+
+	khugepaged_update_load();
+
+	if (atomic_read(&khugepaged_load_heavy))
+		return msecs + msecs / 2;
+
+	return max(msecs - msecs / 4, 1U);
+}
+
 static DEFINE_SPINLOCK(khugepaged_mm_lock);
 static DECLARE_WAIT_QUEUE_HEAD(khugepaged_wait);
 /*
@@ -829,10 +884,11 @@ static enum scan_result __collapse_huge_page_copy(pte_t *pte, struct folio *foli
 static void khugepaged_alloc_sleep(void)
 {
 	DEFINE_WAIT(wait);
+	unsigned int msecs = khugepaged_scale_sleep_msecs(khugepaged_alloc_sleep_millisecs);
 
 	add_wait_queue(&khugepaged_wait, &wait);
 	__set_current_state(TASK_INTERRUPTIBLE|TASK_FREEZABLE);
-	schedule_timeout(msecs_to_jiffies(khugepaged_alloc_sleep_millisecs));
+	schedule_timeout(msecs_to_jiffies(msecs));
 	remove_wait_queue(&khugepaged_wait, &wait);
 }
 
@@ -2671,7 +2727,7 @@ static void khugepaged_wait_work(void)
 {
 	if (khugepaged_has_work()) {
 		const unsigned long scan_sleep_jiffies =
-			msecs_to_jiffies(khugepaged_scan_sleep_millisecs);
+			msecs_to_jiffies(khugepaged_scale_sleep_msecs(khugepaged_scan_sleep_millisecs));
 
 		if (!scan_sleep_jiffies)
 			return;
