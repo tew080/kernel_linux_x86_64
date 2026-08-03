@@ -27,14 +27,6 @@
 #include <linux/vmalloc.h>
 #include <linux/pm_qos.h>
 #include <linux/bitfield.h>
-#include <linux/sched/loadavg.h>
-#include <linux/jiffies.h>
-#include <linux/atomic.h>
-#include <linux/workqueue.h>
-#include <linux/notifier.h>
-#if IS_ENABLED(CONFIG_POWER_SUPPLY)
-#include <linux/power_supply.h>
-#endif
 #include <trace/events/power.h>
 #include <linux/units.h>
 
@@ -310,10 +302,7 @@ static bool hwp_active __ro_after_init;
 static int hwp_mode_bdw __ro_after_init;
 static bool per_cpu_limits __ro_after_init;
 static bool hwp_forced __ro_after_init;
-static bool hwp_boost __read_mostly = true;
-module_param(hwp_boost, bool, 0644);
-MODULE_PARM_DESC(hwp_boost,
-	"Enable the periodic HWP boosting during boot up");
+static bool hwp_boost __read_mostly;
 static bool hwp_is_hybrid;
 
 static struct cpufreq_driver *intel_pstate_driver __read_mostly;
@@ -782,151 +771,6 @@ static int intel_pstate_set_energy_pref_index(struct cpudata *cpu_data,
 	}
 
 	return ret;
-}
-
-static bool auto_epp __read_mostly = true;
-module_param(auto_epp, bool, 0644);
-MODULE_PARM_DESC(auto_epp,
-	"Automatically tune energy_performance_preference based on AC/battery "
-	"and system load (default: true). Does not override any CPU whose "
-	"EPP was set manually via sysfs.");
-
-#define EPP_AUTOTUNE_INTERVAL		(2 * HZ)
-#define EPP_AUTOTUNE_LOAD_UPDATE_INTERVAL	(HZ / 2)
-
-#if IS_ENABLED(CONFIG_POWER_SUPPLY)
-static atomic_t epp_ac_online = ATOMIC_INIT(1);
-static void epp_ac_update_fn(struct work_struct *w);
-static DECLARE_WORK(epp_ac_update_work, epp_ac_update_fn);
-
-static void epp_ac_update_fn(struct work_struct *w)
-{
-	atomic_set(&epp_ac_online, power_supply_is_system_supplied());
-}
-
-static int epp_ac_notifier_call(struct notifier_block *nb,
-				 unsigned long val, void *data)
-{
-	schedule_work(&epp_ac_update_work);
-	return NOTIFY_OK;
-}
-
-static struct notifier_block epp_ac_notifier = {
-	.notifier_call = epp_ac_notifier_call,
-};
-#endif
-
-static atomic_t epp_load_heavy = ATOMIC_INIT(0);
-static unsigned long epp_load_next_update;
-static bool epp_load_prev_heavy;
-
-#define EPP_LOAD_EXIT_PCT	80	/* ออกจาก heavy เมื่อโหลด < 80% ของ enter threshold */
-
-static void epp_update_load(void)
-{
-	unsigned long now = jiffies;
-	unsigned long enter_thresh, exit_thresh;
-	bool heavy;
-
-	if (time_before(now, epp_load_next_update))
-		return;
-	epp_load_next_update = now + EPP_AUTOTUNE_LOAD_UPDATE_INTERVAL;
-
-	/* เทียบในโดเมน fixed-point ตรงๆ ไม่ shift ตัดทิ้งก่อน กัน precision หาย
-	 * ที่ขอบ (เช่น 15.9 core บนเครื่อง 16 core ต้องยังนับเป็น "เกือบหนัก")
-	 */
-	enter_thresh = (unsigned long)num_online_cpus() << FSHIFT;
-	exit_thresh = enter_thresh * EPP_LOAD_EXIT_PCT / 100;
-
-	heavy = epp_load_prev_heavy;
-	if (avenrun[0] >= enter_thresh)
-		heavy = true;
-	else if (avenrun[0] < exit_thresh)
-		heavy = false;
-	/* อยู่ระหว่าง exit-enter (dead-zone): คงสถานะเดิมไว้ ไม่สลับ */
-
-	epp_load_prev_heavy = heavy;
-	atomic_set(&epp_load_heavy, heavy);
-}
-
-static void intel_pstate_epp_autotune_work_fn(struct work_struct *w);
-static DECLARE_DELAYED_WORK(epp_autotune_work, intel_pstate_epp_autotune_work_fn);
-
-/*
- * Long hold time will keep high perf limits for long time, which negatively
- * impacts perf/watt for some workloads (specpower). 3ms is the stock default
- * — auto-tuned by intel_pstate_epp_autotune_work_fn() below based on AC/load.
-*/
-static int hwp_boost_hold_time_ns = 3 * NSEC_PER_MSEC;
-
-static atomic_t epp_thermal_hot = ATOMIC_INIT(0);
-static unsigned long epp_thermal_next_update;
-static bool epp_thermal_prev_hot;
-
-#define EPP_THERMAL_UPDATE_INTERVAL	(HZ / 2)
-#define EPP_THERMAL_HOT_MARGIN_C	8	/* เข้า "ร้อน" เมื่อเหลือ <8°C ก่อนถึง Tjmax */
-#define EPP_THERMAL_EXIT_MARGIN_C	15	/* ออกจาก "ร้อน" เมื่อห่าง Tjmax เกิน 15°C */
-
-static void epp_update_thermal(void)
-{
-	unsigned long now = jiffies;
-	u64 status;
-	int margin;
-	bool hot;
-
-	if (time_before(now, epp_thermal_next_update))
-		return;
-	epp_thermal_next_update = now + EPP_THERMAL_UPDATE_INTERVAL;
-
-	rdmsrq(MSR_IA32_PACKAGE_THERM_STATUS, status);
-	/* bit 31 = reading valid — ถ้ายังไม่มีค่าที่เชื่อถือได้ ข้ามรอบนี้ คงสถานะเดิม */
-	if (!(status & BIT(31)))
-		return;
-
-	/* bits 22:16 = digital readout (°C ที่เหลือก่อนถึง Tjmax) */
-	margin = (status >> 16) & 0x7f;
-
-	hot = epp_thermal_prev_hot;
-	if (margin <= EPP_THERMAL_HOT_MARGIN_C)
-		hot = true;
-	else if (margin >= EPP_THERMAL_EXIT_MARGIN_C)
-		hot = false;
-
-	epp_thermal_prev_hot = hot;
-	atomic_set(&epp_thermal_hot, hot);
-}
-
-static void intel_pstate_epp_autotune_work_fn(struct work_struct *w)
-{
-	bool ac = !!atomic_read(&epp_ac_online);
-	bool heavy;
-	bool thermal_hot;
-	int hold_ms;
-
-	if (!READ_ONCE(auto_epp)) {
-		WRITE_ONCE(hwp_boost_hold_time_ns, 3 * NSEC_PER_MSEC);
-		schedule_delayed_work(&epp_autotune_work, EPP_AUTOTUNE_INTERVAL);
-		return;
-	}
-
-	epp_update_load();
-	heavy = atomic_read(&epp_load_heavy);
-	epp_update_thermal();
-	thermal_hot = atomic_read(&epp_thermal_hot);
-
-	if (thermal_hot)
-		hold_ms = 1;    /* ใกล้ throttle: ตัด boost ไวสุดเสมอ ไม่สน AC/load เลย
-				 * เพราะ boost ค้างยาวตอนใกล้ throttle มีแต่ซ้ำเติม */
-	else if (ac && heavy)
-		hold_ms = 10;   /* เกม/compile บน AC: boost ค้างนานขึ้น
-				 * เกาะ burst ถัดไปได้ไวกว่า ไม่ตัดกลาง */
-	else if (!ac && !heavy)
-		hold_ms = 1;    /* แบต+ว่าง: ตัด boost ไวสุด ประหยัดแบต */
-	else
-		hold_ms = 3;    /* ค่า stock เดิม */
-
-	WRITE_ONCE(hwp_boost_hold_time_ns, hold_ms * NSEC_PER_MSEC);
-	schedule_delayed_work(&epp_autotune_work, EPP_AUTOTUNE_INTERVAL);
 }
 
 static ssize_t show_energy_performance_available_preferences(
@@ -2516,6 +2360,14 @@ static void intel_pstate_get_cpu_pstates(struct cpudata *cpu)
 	intel_pstate_set_min_pstate(cpu);
 }
 
+/*
+ * Long hold time will keep high perf limits for long time,
+ * which negatively impacts perf/watt for some workloads,
+ * like specpower. 3ms is based on experiements on some
+ * workoads.
+ */
+static int hwp_boost_hold_time_ns = 3 * NSEC_PER_MSEC;
+
 static inline void intel_pstate_hwp_boost_up(struct cpudata *cpu)
 {
 	u64 hwp_req = READ_ONCE(cpu->hwp_req_cached);
@@ -4054,15 +3906,6 @@ hwp_cpu_matched:
 		}
 
 		pr_info("HWP enabled\n");
-
-#if IS_ENABLED(CONFIG_POWER_SUPPLY)
-			power_supply_reg_notifier(&epp_ac_notifier);
-			/* sample สถานะ AC ครั้งแรกแบบ synchronous ได้ตรงนี้ที่เดียว
-			 * เพราะเป็น __init path ตอน boot ไม่ใช่ hot/atomic context
-			 * หลังจากนี้จะอัปเดตผ่าน notifier+workqueue เท่านั้น */
-			atomic_set(&epp_ac_online, power_supply_is_system_supplied());
-#endif
-			schedule_delayed_work(&epp_autotune_work, EPP_AUTOTUNE_INTERVAL);
 	} else if (boot_cpu_has(X86_FEATURE_HYBRID_CPU)) {
 		pr_warn("Problematic setup: Hybrid processor with disabled HWP\n");
 	}
