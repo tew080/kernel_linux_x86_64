@@ -196,7 +196,7 @@ struct scan_control {
 /*
  * From 0 .. MAX_SWAPPINESS.  Higher means more swappy.
  */
-int vm_swappiness = 60;
+int vm_swappiness = 100;
 
 #ifdef CONFIG_MEMCG
 
@@ -239,7 +239,7 @@ static bool writeback_throttling_sane(struct scan_control *sc)
 	return false;
 }
 
-static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
+static int sc_swappiness_base(struct scan_control *sc, struct mem_cgroup *memcg)
 {
 	if (sc->proactive && sc->proactive_swappiness)
 		return *sc->proactive_swappiness;
@@ -261,11 +261,56 @@ static bool writeback_throttling_sane(struct scan_control *sc)
 	return true;
 }
 
-static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
+static int sc_swappiness_base(struct scan_control *sc, struct mem_cgroup *memcg)
 {
 	return READ_ONCE(vm_swappiness);
 }
 #endif
+
+/*
+ * DOC: swappiness-adaptive-pressure
+ *
+ * vm_swappiness ที่ตั้งไว้ 100 เป็นการ
+ * ตัดสินใจครั้งเดียวว่า "swap อยู่บน zram เร็ว ใช้ได้เต็มที่กว่า swap
+ * บนดิสก์จริง" แต่ยังเป็นค่าคงที่ ไม่แยกแยะว่าตอนนี้กดดันหนักแค่ไหน
+ *
+ * ระหว่างงานหนักพร้อมกันหลายตัว (เปิดเกม+เบราว์เซอร์+IDE) ตอนที่กดดัน
+ * เริ่มหนักขึ้นเรื่อยๆ (sc->priority ไล่ลงจาก DEF_PRIORITY) การ swap
+ * anon page ที่ idle ออกไปยัง zram (ถูก/เร็ว) ดีกว่าการไป evict file
+ * page ของโปรแกรมที่ "กำลังรันอยู่จริง" (binary/library ที่ mapped ค้าง
+ * อยู่) เพราะ evict file page เหล่านั้นแล้วโปรแกรมเรียกใช้ซ้ำจะเกิด
+ * major fault อ่านกลับจากดิสก์จริง (ช้ากว่า zram มาก) — ยิ่งกดดันหนัก
+ * ยิ่งควรเอนไปทาง swap anon มากกว่าเดิม เพื่อปกป้อง responsiveness ของ
+ * โปรแกรม foreground ที่กำลังใช้อยู่พอดีตอนระบบหนักที่สุด
+ *
+ * เคารพค่าพิเศษเสมอไม่แตะ: 0 (ปิด swap เอง) และ SWAPPINESS_ANON_ONLY
+ * (memcg สั่งเฉพาะเจาะจงอยู่แล้ว) ไม่มีทาง escalate ทับค่าที่ตั้งใจปิดไว้
+ *
+ * มี safety gate ห้าม escalate ถ้า swap เหลือน้อยอยู่แล้ว (< 32 คลัสเตอร์)
+ * กันไม่ให้ดันไปใช้ swap ที่กำลังจะเต็มอยู่แล้วจนสถานการณ์แย่ลงไปอีก
+ *
+ * เป็นแค่เลขคณิตล้วนๆ ไม่มี lock/timer/allocation เพิ่มเลย เรียกทุกครั้งที่
+ * มีการคำนวณ scan count อยู่แล้วโดยธรรมชาติ ไม่กระทบ low-latency
+ */
+static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
+{
+	int swappiness = sc_swappiness_base(sc, memcg);
+	int boost;
+
+	if (swappiness <= 0 || swappiness == SWAPPINESS_ANON_ONLY)
+		return swappiness;
+
+	if (get_nr_swap_pages() < (long)SWAP_CLUSTER_MAX * 32)
+		return swappiness;
+
+	if (sc->priority < DEF_PRIORITY) {
+		boost = (DEF_PRIORITY - sc->priority) *
+			(MAX_SWAPPINESS - swappiness) / DEF_PRIORITY;
+		swappiness = min(swappiness + boost, MAX_SWAPPINESS);
+	}
+
+	return swappiness;
+}
 
 static void set_task_reclaim_state(struct task_struct *task,
 				   struct reclaim_state *rs)
