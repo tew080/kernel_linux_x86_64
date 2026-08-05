@@ -1910,69 +1910,71 @@ static int sysctl_extfrag_threshold = 500;
 static int __read_mostly sysctl_compact_memory;
 
 /*
- * compaction-adaptive-proactiveness
+ * เดิม compaction_dynamic_tuning() switch tier แบบทันที
+ * ไม่มี ramping — พอ load ตกจาก "หนัก" ไป "ว่าง" ทันที proactiveness
+ * จะกระโดดไปค่าสูงสุดในติ๊กเดียว (2 วิ) ทำให้ kcompactd ทำงานเต็มแรง
+ * พอดีกับจังหวะที่ RAM เพิ่งว่างมาก (เช่นปิดโปรแกรมกินแรมหนัก) ซึ่ง
+ * มักตรงกับจังหวะที่ user กลับมาคลิกใช้งานเครื่องพอดี (trigger
+ * swap-in decompress) — CPU cycle ที่ต้องใช้ decompress ไปชนกับ
+ * kcompactd ที่วิ่งเต็มแรงพอดี ทำให้กระตุกเห็นชัด ทั้งที่ swap-in
+ * เดี่ยวๆ ควรเบามากจนไม่รู้สึก
  *
- * ขอบเขตที่ตัดสินใจ "ทำให้ฉลาด": ปรับเฉพาะ sysctl_compaction_proactiveness
- * เป็นค่าไดนามิกรอบ baseline ที่ผู้ใช้ตั้งไว้ ตามภาระงานปัจจุบันของระบบ —
- * ระบบว่าง (load เบา) ให้ compaction เชิงรุกทำงานถี่ขึ้นกว่าที่ตั้งไว้
- * เล็กน้อย (ตอนนี้มีรอบว่างให้ใช้ ทำล่วงหน้าไว้ถูกกว่ามาทำตอน alloc พลาด)
- * ส่วนตอนระบบโหลดหนัก (เช่นกำลัง compile/เล่นเกม) ให้ผ่อนลงครึ่งหนึ่ง
- * ไม่ให้ไปแย่ง CPU/memory-bandwidth จาก foreground workload — ตรงเป้าหมาย
- * "responsive ต่อ pressure + รับโหลดหนักได้ดี" โดยไม่ทำให้ compaction
- * หายไปเฉยๆ (แค่ผ่อน ไม่ปิด)
- *
- * sysctl_extfrag_threshold และ sysctl_compact_memory จงใจ "ไม่" ทำให้เป็น
- * ไดนามิกด้วยเหตุผลคนละแบบ:
- *  - extfrag_threshold กำหนดว่าความล้มเหลวของ high-order alloc เกิดจาก
- *    fragmentation หรือ low-memory จริง ซึ่งไปกระทบเส้นทาง reclaim/OOM
- *    โดยตรง การขยับค่านี้แบบ runtime จะทำให้พฤติกรรมการตัดสินใจ
- *    OOM-vs-compact ไม่คงเส้นคงวา คาดเดายาก เสี่ยงกว่าประโยชน์ที่ได้มาก
- *    เก็บเป็นค่าที่ผู้ดูแลระบบตั้งเองแบบตรงไปตรงมาดีกว่า
- *  - compact_memory เป็นปุ่ม trigger ครั้งเดียวสำหรับแอดมิน/สคริปต์สั่ง
- *    บีบอัดหน่วยความจำทันที (เช่นก่อนเข้าช่วง maintenance) ความ "ฉลาด"
- *    แบบอัตโนมัติมีอยู่แล้วในกลไก proactive compaction ของ kcompactd
- *    ถ้าทำให้ trigger นี้ฉลาดขึ้นเอง จะขัดกับเจตนาของมันที่ต้องพึ่งพาได้
- *    และคาดเดาผลได้แน่นอนเมื่อแอดมินสั่งเอง
+ * แก้ด้วย 2 ชั้น: (1) ramp ค่าเข้าใกล้ target แบบค่อยเป็นค่อยไป
+ * ไม่กระโดดเต็มสเกลในติ๊กเดียว (2) cooldown ก่อนจะ "ขยัน" ขึ้น
+ * (ผ่อนคลาย pressure) กันกรณี load ร่วงแค่ชั่วครู่เดี๋ยวเดียวแล้ว
+ * เด้งกลับมาหนักอีก — เหมือน SWAP_CLUSTER_RELAX_INTERVAL ที่ใช้กับ
+ * page_cluster ไปก่อนหน้า ไม่ต้อง throttle ทิศทาง "ลดลง" (บีบตัวเอง
+ * ให้เบาลงทำได้ทันทีเสมอ ปลอดภัยกว่าไม่ต้องรอ)
  */
-#define COMPACTION_LOAD_UPDATE_INTERVAL	(HZ / 2)
+#define COMPACTION_PROACTIVE_RAMP_STEP		5   /* ต่อ tick (2 วิ) */
+#define COMPACTION_RELAX_COOLDOWN		(10 * HZ)
 
-static atomic_t compaction_load_heavy = ATOMIC_INIT(0);
-static unsigned long compaction_load_next_update;
+static unsigned long compaction_last_relax_jif;
 
-static void compaction_update_load(void)
+static void compaction_dynamic_tuning(void)
 {
-	unsigned long now = jiffies;
+	unsigned long load = avenrun[0] >> FSHIFT;
+	unsigned int ncpu = num_online_cpus();
+	unsigned int target_proactiveness;
+	int target_extfrag;
+	unsigned int cur;
 
-	if (time_before(now, compaction_load_next_update))
-		return;
-	/*
-	 * เขียนซ้ำได้จากหลาย CPU/หลาย node พร้อมกันอย่างปลอดภัย — เป็นแค่
-	 * atomic_set() ค่าที่คำนวณใหม่ทั้งหมดเสมอ ไม่มี read-modify-write
-	 * เลยไม่มีทาง corrupt ต่อให้แข่งกันอัปเดตในหน้าต่างเดียวกันหลายรอบ
-	 */
-	compaction_load_next_update = now + COMPACTION_LOAD_UPDATE_INTERVAL;
-	atomic_set(&compaction_load_heavy, avenrun[0] > (num_online_cpus() << FSHIFT));
-}
+	if (2 * load < ncpu) {
+		target_proactiveness = 30;
+		target_extfrag = 400;
+	} else if (load < ncpu) {
+		target_proactiveness = 15;
+		target_extfrag = 650;
+	} else {
+		target_proactiveness = 5;
+		target_extfrag = 800;
+	}
 
-/*
- * คืนค่า proactiveness ที่ "จะใช้จริง" ในการคำนวณ watermark เท่านั้น —
- * ไม่เคยเขียนทับ sysctl_compaction_proactiveness เอง (ผู้ใช้ยังอ่านค่าที่
- * ตัวเองตั้งไว้ผ่าน sysctl ได้ตรงไปตรงมาเสมอ ไม่ถูก "โกหก" จากการปรับภายใน)
- * และเคารพสวิตช์ปิด/เปิดหลัก (0 = ปิด) อย่างเคร่งครัด ไม่มีทางเปิดเองได้
- */
-static unsigned int compaction_effective_proactiveness(void)
-{
-	unsigned int base = sysctl_compaction_proactiveness;
+	cur = READ_ONCE(sysctl_compaction_proactiveness);
 
-	if (!base)
-		return 0;
+	if (target_proactiveness > cur) {
+		/*
+		 * กำลังจะ "ขยันขึ้น" (ผ่อนคลาย) — ต้องผ่าน cooldown ก่อน
+		 * กัน flapping ตอน load แกว่งสั้นๆ ไม่ใช่ pressure ที่คลี่คลาย
+		 * จริง
+		 */
+		unsigned long now = jiffies;
 
-	compaction_update_load();
+		if (time_before(now, compaction_last_relax_jif +
+				 COMPACTION_RELAX_COOLDOWN))
+			return;
+		compaction_last_relax_jif = now;
 
-	if (atomic_read(&compaction_load_heavy))
-		return max(base / 2, 1U);
+		cur = min(cur + COMPACTION_PROACTIVE_RAMP_STEP,
+			  target_proactiveness);
+	} else if (target_proactiveness < cur) {
+		/* บีบให้เบาลง (ระบบเริ่มหนัก) ทำได้ทันทีเสมอ ไม่ throttle
+		 * เพราะการตอบสนองไวตอน "จะหนัก" สำคัญกว่าตอน "จะว่าง" */
+		cur = target_proactiveness;
+	}
 
-	return min(base + base / 4, 100U);
+	WRITE_ONCE(sysctl_compaction_proactiveness, cur);
+	WRITE_ONCE(sysctl_extfrag_threshold, target_extfrag);
 }
 
 static inline void
@@ -2299,7 +2301,7 @@ static unsigned int fragmentation_score_wmark(bool low)
 {
 	unsigned int wmark_low, leeway;
 
-	wmark_low = 100U - compaction_effective_proactiveness();
+	wmark_low = 100U - READ_ONCE(sysctl_compaction_proactiveness);
 	leeway = min(10U, wmark_low / 2);
 	return low ? wmark_low : min(wmark_low + leeway, 100U);
 }
@@ -2308,8 +2310,15 @@ static bool should_proactive_compact_node(pg_data_t *pgdat)
 {
 	int wmark_high;
 
-	if (!sysctl_compaction_proactiveness || kswapd_is_running(pgdat))
-		return false;
+	/* 
+     * เรียกฟังก์ชันจูนนิ่งอัตโนมัติ เพื่อปรับค่า sysctl 
+     * ตาม CPU Load ปัจจุบัน ก่อนนำค่าไปใช้ตัดสินใจ
+     */
+    compaction_dynamic_tuning();
+
+    /* ใช้ READ_ONCE ป้องกัน Race condition จากการอ่านค่าที่อาจเปลี่ยนแบบ Asynchronous */
+    if (!READ_ONCE(sysctl_compaction_proactiveness) || kswapd_is_running(pgdat))
+          return false;
 
 	wmark_high = fragmentation_score_wmark(false);
 	return fragmentation_score_node(pgdat) > wmark_high;
