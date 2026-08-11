@@ -921,7 +921,7 @@ endif # need-config
 
 KBUILD_CFLAGS	+= -fno-delete-null-pointer-checks
 
-KCFLAGS += -fno-semantic-interposition
+KBUILD_CFLAGS += -fno-semantic-interposition
 
 ifdef CONFIG_CC_OPTIMIZE_FOR_PERFORMANCE
 KBUILD_CFLAGS += -O2
@@ -930,6 +930,27 @@ else ifdef CONFIG_CC_OPTIMIZE_FOR_SIZE
 KBUILD_CFLAGS += -Os
 KBUILD_RUSTFLAGS += -Copt-level=s
 endif
+
+ifndef KBUILD_EXTMOD
+ifdef CONFIG_AUTOFDO_CLANG
+KBUILD_CFLAGS += -fdebug-info-for-profiling
+KBUILD_CFLAGS += -mllvm -enable-fs-discriminator=true
+KBUILD_CFLAGS += -mllvm -improved-fs-discriminator=true
+endif
+
+ifndef CONFIG_DEBUG_INFO
+KBUILD_CFLAGS += -gmlt
+endif
+
+ifdef CONFIG_AUTOFDO_CLANG_STEPTWO
+KBUILD_CFLAGS += -fprofile-sample-use=$(CLANG_AUTOFDO_PROFILE)
+KBUILD_CFLAGS += -fsample-profile-use-profi
+KBUILD_CFLAGS += -fprofile-sample-accurate
+KBUILD_CFLAGS += -fsplit-machine-functions
+endif
+
+KBUILD_CFLAGS += -mllvm -enable-ext-tsp-block-placement=1
+endif # !KBUILD_EXTMOD
 
 # Always set `debug-assertions` and `overflow-checks` because their default
 # depends on `opt-level` and `debug-assertions`, respectively.
@@ -1089,13 +1110,26 @@ export CC_FLAGS_SCS
 endif
 
 ifdef CONFIG_LTO_CLANG
-CC_FLAGS_LTO    := -flto=full -fvisibility=hidden
-KBUILD_LDFLAGS += -mllvm -import-instr-limit=5
+ifdef CONFIG_LTO_CLANG_THIN
+CC_FLAGS_LTO := -flto=thin -fsplit-lto-unit
+KBUILD_LDFLAGS += --thinlto-cache-dir=$(extmod_prefix).thinlto-cache
+KBUILD_LDFLAGS += -mllvm -import-instr-limit=20
+else
+CC_FLAGS_LTO := -flto
+endif
+CC_FLAGS_LTO += -fvisibility=hidden
+endif
+
+ifdef CONFIG_LTO_CLANG_THIN
+ifdef CONFIG_AUTOFDO_CLANG_STEPTWO
+	KBUILD_LDFLAGS += --lto-sample-profile=$(CLANG_AUTOFDO_PROFILE)
+endif
+	KBUILD_LDFLAGS += --mllvm=-enable-fs-discriminator=true --mllvm=-improved-fs-discriminator=true
 endif
 
 ifdef CONFIG_LTO
-KBUILD_CFLAGS   += -fno-lto $(CC_FLAGS_LTO)
-KBUILD_AFLAGS   += -fno-lto
+KBUILD_CFLAGS += $(CC_FLAGS_LTO)
+KBUILD_AFLAGS += -fno-lto
 export CC_FLAGS_LTO
 endif
 

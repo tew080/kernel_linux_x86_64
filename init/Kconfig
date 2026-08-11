@@ -1514,7 +1514,13 @@ config TWEAKS
 	default n
 	help
 	  custom
-	  
+
+config AUTOFDO_CLANG_STEPTWO
+	bool "AutoFDO profile step2"
+	default n
+	help
+	  AutoFDO profile step2.
+
 config SCHED_AUTOGROUP
 	bool "Automatic process group scheduling"
 	depends on !SCHED_ALT

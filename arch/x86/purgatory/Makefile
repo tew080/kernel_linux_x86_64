@@ -22,6 +22,17 @@ KBUILD_CFLAGS := $(filter-out -fprofile-sample-use=% -fprofile-use=%,$(KBUILD_CF
 # by kexec. Remove -flto=* flags.
 KBUILD_CFLAGS := $(filter-out $(CC_FLAGS_LTO),$(KBUILD_CFLAGS))
 
+ifdef CONFIG_AUTOFDO_CLANG_STEPTWO
+KBUILD_CFLAGS := $(filter-out -fsample-profile-use-profi \
+                               -fprofile-sample-accurate \
+                               -fsplit-machine-functions \
+                               -fdebug-info-for-profiling \
+                               -flto=thin -flto -fsplit-lto-unit \
+                               -fvisibility=hidden, \
+                               $(KBUILD_CFLAGS))
+KBUILD_CFLAGS := $(filter-out -fprofile-sample-use=%,$(KBUILD_CFLAGS))
+endif
+
 # When linking purgatory.ro with -r unresolved symbols are not checked,
 # also link a purgatory.chk binary without -r to check for unresolved symbols.
 PURGATORY_LDFLAGS := -e purgatory_start -z nodefaultlib

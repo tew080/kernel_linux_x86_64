@@ -18,6 +18,70 @@
 #patch -p1 < patch/
 #patch -p1 -R < patch/
 
+# AutoFDO Profile
+# 0
+# CONFIG_HARDENED_USERCOPY=n
+# CONFIG_HARDENED_USERCOPY_DEFAULT_ON=n
+# CONFIG_RANDOMIZE_BASE=n
+# CONFIG_AUTOFDO_CLANG=y
+# 1
+#sudo apt install -y llvm-19
+#sudo update-alternatives --install /usr/bin/llvm-profgen llvm-profgen /usr/bin/llvm-profgen-19 100
+# 2
+#cd /path/to/your/kernel-source
+#make -C tools/perf WERROR=0 -j$(nproc)
+#sudo cp tools/perf/perf /usr/local/bin/perf
+#perf --version
+#sudo sysctl -w kernel.perf_event_paranoid=-1
+#sudo sysctl -w kernel.kptr_restrict=0
+#sudo perf record -e cycles:k -j any,k -a -- sleep 600
+#sudo perf record -e cycles:k -c 500009 -j any,k -a -m 16M -- sleep 600
+# 3
+#sudo cp /proc/kallsyms kernel.kallsyms
+#sudo perf script -i perf.data --show-mmap-events -F ip,brstack > perf.script
+# 4
+#llvm-profgen --kernel \
+#  --binary=vmlinux \
+#  --kallsyms=kernel.kallsyms \
+# --perfscript=perf.script \
+#  -o kernel.afdo
+# 4.1 multiple workloads
+#llvm-profgen --kernel --binary=vmlinux --perfscript=perf.script -o perf01.afdo
+###sudo cp autofdo-boot.service /etc/systemd/system/
+###sudo cp /root/boot.perf.data /home/tew404/kernel_build/pf/boot
+#llvm-profgen --kernel --binary=vmlinux --perfscript=workload_game.script -o game.afdo
+#llvm-profgen --kernel --binary=vmlinux --perfscript=workload_db.script -o db.afdo
+#4.1.1
+#llvm-profdata merge -sample -extbinary boot1.afdo boot2.afdo boot3.afdo -o merged_boot.afdo
+#llvm-profdata merge -sample -output=kernel_combined.afdo boot.afdo game.afdo db.afdo
+#4.1.2
+#llvm-profdata merge -sample -output=kernel_combined.afdo \
+#  -weighted-input=5,game.afdo \
+#  -weighted-input=1,boot.afdo \
+#  -weighted-input=1,db.afdo
+#4.1.3
+#cat boot.script game.script db.script > combined.script
+#4.1.4
+#llvm-profgen --kernel \
+#  --binary=vmlinux \
+#  --kallsyms=kernel.kallsyms \
+#  --perfscript=combined.script \
+#  -o kernel_combined.afdo
+# 5
+#make LLVM=1 CLANG_AUTOFDO_PROFILE=$(pwd)/kernel.afdo -j$(nproc)
+#KCFLAGS='-Rpass=sample-profile' \
+#GRUB_CMDLINE_LINUX_DEFAULT="quiet splash nokaslr"
+
+#sudo perf inject -b -i perf.data -o perf.data.hit
+#sudo /home//gf-clang-23.0.0/bin/create_llvm_prof \
+#  --format=propeller \
+#  --binary=vmlinux \
+#  --profile=perf.data.hit \
+#  --out=kernel_prop_cc_profile.txt \
+#  --propeller_symorder=kernel_prop_ld_profile.txt \
+#  --profiled_binary_name="[kernel.kallsyms]" \
+#  --ignore_sample_mmap_offset
+
 #cd ~/kernel/test/linux-6.15.3/tools/perf
 #sudo ./perf record -e cycles:k -a
 
@@ -60,7 +124,7 @@
 #MAKE[0]="unset ARCH; [ ! -h /llvm19.0.0/bin ] && export CC=/llvm19.0.0/bin/clang; env NV_VERBOSE=1 \
     #LLVM=1 LLVM_IAS=1 'make' -j$PROCS_NUM NV_EXCLUDE_BUILD_MODULES='' KERNEL_UNAME=${kernelver} IGNORE_XEN_PRESENCE=1 IGNORE_CC_MISMATCH=1 SYSSRC=$kernel_source_dir LD=/llvm19.0.0/bin/ld.lld>
 #sudo dkms install nvidia/595.84 -k 7.1.5-lamud-71v1xc
-
+#sudo cat /var/lib/dkms/nvidia/595.84/build/make.log | grep -iE "error|failed" | tail -n 30
 #sudo dpkg --configure -a
 
 # ปิด systemd-oomd ที่ต้องใช้ PSI
@@ -77,8 +141,12 @@
 #sudo dmesg | grep -iE "zram|zcomp|page allocation failure" | tail -n 30
 #sudo dmesg -T | grep -B 20 "zram_add+0x112" | head -30
 
+#VKD3D_CONFIG=dxr11 __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia DXVK_ASYNC=1 %command% -dx11
+
 COMPILER="gcc" # ค่าเริ่มต้น
 CLEAN=0
+PROFILE="not_profile" # ค่าเริ่มต้น
+PROPELLER="not_propeller" # ค่าเริ่มต้น
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -94,9 +162,17 @@ while [[ $# -gt 0 ]]; do
             COMPILER="clang"
             shift
             ;;
+        -p|--profile)
+            PROFILE="user_profile"
+            shift
+            ;;
+        -pl|--propeller)
+            PROPELLER="user_propeller"
+            shift
+            ;;
         *)
             echo "[ERROR] พารามิเตอร์ไม่ถูกต้อง: $1"
-            echo "วิธีใช้งาน: $0 [--clean] [--gcc | --clang]"
+            echo "วิธีใช้งาน: $0 [--clean] [--gcc | --clang] [--profile] [--propeller]"
             exit 1
             ;;
     esac
@@ -116,8 +192,64 @@ export PATH=$tool/bin:$PATH
 # ==========================================
 # 2. ตั้งค่าตัวแปร Compiler ตามที่ผู้ใช้เลือก
 # ==========================================
-if [[ "$COMPILER" == "clang" ]]; then
-    # การตั้งค่าสำหรับ Clang / LLVM
+# ==========================================
+# 2. ตั้งค่าตัวแปร Compiler ตามที่ผู้ใช้เลือก
+# ==========================================
+if [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" && "$PROPELLER" == "user_propeller" ]]; then
+    export LLVM=1
+    export LLVM_IAS=1
+    export CC=$tool/bin/clang
+    export CXX=$tool/bin/clang++
+    export HOSTCC=$tool/bin/clang
+    export HOSTCXX=$tool/bin/clang++
+    export LD=$tool/bin/ld.lld
+    export AR=$tool/bin/llvm-ar
+    export NM=$tool/bin/llvm-nm
+    export STRIP=$tool/bin/llvm-strip
+    export OBJCOPY=$tool/bin/llvm-objcopy
+    export OBJDUMP=$tool/bin/llvm-objdump
+    export READELF=$tool/bin/llvm-readelf
+    export HOSTAR=$tool/bin/llvm-ar
+    export HOSTLD=$tool/bin/ld.lld
+    export KCFLAGS="-fbasic-block-address-map"
+    export CC_PROFILE="kernel_prop_cc_profile.txt"
+    export LD_PROFILE="kernel_prop_ld_profile.txt"
+    export PROP_PREFIX="kernel_prop"
+
+    ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
+        KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
+        KCONFIG_OVERWRITECONFIG=1 \
+        LLVM=1 LLVM_IAS=1 \
+        CLANG_AUTOFDO_PROFILE=$(pwd)/perf01.afdo \
+        CLANG_PROPELLER_PROFILE_PREFIX=$(pwd)/${PROP_PREFIX} \
+        bindeb-pkg"
+
+elif [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" ]]; then
+    export LLVM=1
+    export LLVM_IAS=1
+    export CC=$tool/bin/clang
+    export CXX=$tool/bin/clang++
+    export HOSTCC=$tool/bin/clang
+    export HOSTCXX=$tool/bin/clang++
+    export LD=$tool/bin/ld.lld
+    export AR=$tool/bin/llvm-ar
+    export NM=$tool/bin/llvm-nm
+    export STRIP=$tool/bin/llvm-strip
+    export OBJCOPY=$tool/bin/llvm-objcopy
+    export OBJDUMP=$tool/bin/llvm-objdump
+    export READELF=$tool/bin/llvm-readelf
+    export HOSTAR=$tool/bin/llvm-ar
+    export HOSTLD=$tool/bin/ld.lld
+    export KCFLAGS="-fbasic-block-address-map"
+
+    ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
+        KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
+        KCONFIG_OVERWRITECONFIG=1 \
+        LLVM=1 LLVM_IAS=1 \
+        CLANG_AUTOFDO_PROFILE=$(pwd)/perf01.afdo \
+        bindeb-pkg"
+
+elif [[ "$COMPILER" == "clang" ]]; then
     export LLVM=1
     export LLVM_IAS=1
     export CC=$tool/bin/clang
@@ -139,14 +271,14 @@ if [[ "$COMPILER" == "clang" ]]; then
         KCONFIG_OVERWRITECONFIG=1 \
         LLVM=1 LLVM_IAS=1 \
         bindeb-pkg"
+
 else
-    # การตั้งค่าสำหรับ GCC-13
     unset LLVM
     unset LLVM_IAS
-    export CC=$tool/bin/gcc-
-    export CXX=$tool/bin/g++-
-    export HOSTCC=$tool/bin/gcc-
-    export HOSTCXX=$tool/bin/g++-
+    export CC=$tool/bin/gcc-13
+    export CXX=$tool/bin/g++-13
+    export HOSTCC=$tool/bin/gcc-13
+    export HOSTCXX=$tool/bin/g++-13
     export LD=$tool/bin/ld
     export AR=$tool/bin/ar
     export NM=$tool/bin/nm
@@ -159,7 +291,7 @@ else
 
     ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
         KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
-        KCONFIG_OVERWRITECONFIG=1 ห\
+        KCONFIG_OVERWRITECONFIG=1 \
         bindeb-pkg"
 fi
 
@@ -173,9 +305,12 @@ cp custom_config .config
 # ==========================================
 check_compiler() {
     echo "----------------------------------------------------"
+    echo "----------------------------------------------------"
     if [[ "$COMPILER" == "clang" ]]; then
         echo "[INFO] โหมดคอมไพล์: CLANG / LLVM"
         echo "[INFO] ตัวแปร CC ที่ตั้งไว้: $CC"
+        echo "[INFO] ใช้ Profile: $PROFILE"
+        echo "[INFO] ใช้ propeller: $PROPELLER"
         if command -v $CC &> /dev/null; then
             echo "[INFO] เวอร์ชันที่ใช้: $($CC --version | head -n 1)"
         else
@@ -193,6 +328,7 @@ check_compiler() {
         fi
     fi
     echo "----------------------------------------------------"
+    echo "----------------------------------------------------"
 }
 
 # ==========================================
@@ -201,9 +337,11 @@ check_compiler() {
 check_compiler
 
 # สร้าง Modules ก่อน
-make -j$(nproc) modules
+#make -j$(nproc) modules
 
 # สร้างแพ็กเกจ .deb และติดตั้ง Modules พร้อม Strip
 make -j$(nproc) $ACTIVE_BUILD INSTALL_MOD_STRIP=1
+
+#make LLVM=1 V=1 -j$(nproc) $ACTIVE_BUILD | grep -E "profile-sample-use|propeller"
 
 echo "[✅] เสร็จสิ้นกระบวนการทำงาน!"
