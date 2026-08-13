@@ -661,6 +661,7 @@ void setup_per_zone_wmarks(void);
 void calculate_min_free_kbytes(void);
 int __meminit init_per_zone_wmark_min(void);
 void page_alloc_sysctl_init(void);
+void wmark_check_sustained_load(void);
 
 /*
  * Structure for holding the mostly immutable allocation parameters passed

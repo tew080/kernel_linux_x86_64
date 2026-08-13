@@ -1975,6 +1975,11 @@ static void compaction_dynamic_tuning(void)
 
 	WRITE_ONCE(sysctl_compaction_proactiveness, cur);
 	WRITE_ONCE(sysctl_extfrag_threshold, target_extfrag);
+
+
+	wmark_check_sustained_load();   /* เกาะ tick 2 วิเดิม ตัวมันเอง
+					  * throttle ภายในเหลือ 1 ครั้ง/นาที
+					  * และ 1 ครั้งทั้ง session อยู่แล้ว */
 }
 
 static inline void

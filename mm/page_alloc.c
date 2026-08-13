@@ -2285,6 +2285,73 @@ static inline bool boost_watermark(struct zone *zone)
 }
 
 /*
+ * [SMART, cost-effective] แทนที่จะเดาจาก CPU load (avenrun) ซึ่งมี lag
+ * หลักสิบวินาทีและไม่รับประกันว่าเกี่ยวกับ memory pressure จริง —
+ * ใช้ ALLOCSTALL vm_event ตรงๆ ซึ่งคือหลักฐานที่ตรงที่สุดว่า direct
+ * reclaim เกิดขึ้นจริงในระดับระบบ (ดู __count_zid_vm_events(ALLOCSTALL,
+ * ...) ใน vmscan.c ที่ยิงเฉพาะตอน !cgroup_reclaim(sc) เท่านั้น) —
+ * นี่คือกลไกเดียวกับที่ทำให้เกิดอาการกระตุกตอนเปิดแอปหนักพร้อมกัน
+ * เจอครั้งเดียวก็เพียงพอเป็นหลักฐานว่า watermark gap แคบไปสำหรับ
+ * workload นี้ boost แบบทางเดียว ไม่ toggle กลับ (กัน flapping
+ * เหมือนที่แก้ compaction_proactiveness ไปก่อนหน้า)
+ */
+#define WMARK_SUSTAINED_CHECK_INTERVAL	(60 * HZ)
+
+static unsigned long wmark_sustained_last_check;
+static unsigned long wmark_last_allocstall;
+static bool wmark_sustained_boosted;
+
+static unsigned long wmark_read_allocstall(void)
+{
+	unsigned long events[NR_VM_EVENT_ITEMS];
+	unsigned long total = 0;
+	int i;
+
+	all_vm_events(events);
+	for (i = ALLOCSTALL_NORMAL; i <= ALLOCSTALL_MOVABLE; i++)
+		total += events[i];
+
+	return total;
+}
+
+void wmark_check_sustained_load(void)
+{
+	unsigned long now = jiffies;
+	unsigned long stalls, delta;
+	unsigned int cur, boosted;
+
+	if (wmark_sustained_boosted)
+		return;		/* boost แล้วครั้งเดียวพอทั้ง session */
+
+	if (time_before(now, wmark_sustained_last_check +
+			 WMARK_SUSTAINED_CHECK_INTERVAL))
+		return;
+	wmark_sustained_last_check = now;
+
+	stalls = wmark_read_allocstall();
+	delta = stalls - wmark_last_allocstall;
+	wmark_last_allocstall = stalls;
+
+	if (!delta)
+		return;
+
+	cur = READ_ONCE(watermark_scale_factor);
+	boosted = min(cur + cur / 2, 100U);	/* +50%, เพดาน 1% ของ zone */
+
+	wmark_sustained_boosted = true;
+
+	if (boosted <= cur)
+		return;		/* ชน เพดานเดิมอยู่แล้ว ไม่มีอะไรให้ทำต่อ */
+
+	WRITE_ONCE(watermark_scale_factor, boosted);
+	pr_info_ratelimited(
+		"page_alloc: detected %lu direct-reclaim stall(s), "
+		"widening watermark_scale_factor %u -> %u for the rest "
+		"of this session\n", delta, cur, boosted);
+	setup_per_zone_wmarks();
+}
+
+/*
  * When we are falling back to another migratetype during allocation, should we
  * try to claim an entire block to satisfy further allocations, instead of
  * polluting multiple pageblocks?
