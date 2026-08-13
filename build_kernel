@@ -36,6 +36,9 @@
 #sudo sysctl -w kernel.kptr_restrict=0
 #sudo perf record -e cycles:k -j any,k -a -- sleep 600
 #sudo perf record -e cycles:k -c 500009 -j any,k -a -m 16M -- sleep 600
+#sudo perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -c 250007 -j any,k -a -m 64M -- sleep 300
+#
+#stress-ng --cpu 0 --schedmix 4 --vm 4 --vm-bytes 50% --mmap 4 --hdd 2 --hdd-bytes 10G --hdd-opts direct --timeout 300s --metrics-brief
 # 3
 #sudo cp /proc/kallsyms kernel.kallsyms
 #sudo perf script -i perf.data --show-mmap-events -F ip,brstack > perf.script
@@ -57,8 +60,8 @@
 #4.1.2
 #llvm-profdata merge -sample -output=kernel_combined.afdo \
 #  -weighted-input=5,game.afdo \
-#  -weighted-input=1,boot.afdo \
-#  -weighted-input=1,db.afdo
+#  -weighted-input=1,100load.afdo \
+#  -weighted-input=1,overload.afdo
 #4.1.3
 #cat boot.script game.script db.script > combined.script
 #4.1.4
@@ -81,6 +84,16 @@
 #  --propeller_symorder=kernel_prop_ld_profile.txt \
 #  --profiled_binary_name="[kernel.kallsyms]" \
 #  --ignore_sample_mmap_offset
+#
+#/gf-clang-23.0.0/bin/create_llvm_prof \
+#  --format=propeller \
+#  --binary=vmlinux \
+#  --profile=100load.data.hit \
+#  --profile=game.data.hit \
+#  --profile=overload.data.hit \
+#  --out=kernel_prop_cc_profile.txt \
+#  --propeller_symorder=kernel_prop_ld_profile.txt \
+#  --profiled_binary_name="[kernel.kallsyms]"
 
 #cd ~/kernel/test/linux-6.15.3/tools/perf
 #sudo ./perf record -e cycles:k -a
@@ -190,10 +203,13 @@ export TMPDIR=~/tmp_build
 export PATH=$tool/bin:$PATH
 
 # ==========================================
-# 2. ตั้งค่าตัวแปร Compiler ตามที่ผู้ใช้เลือก
+# 2. เตรียมไฟล์ Config
 # ==========================================
+cp custom_config .config
+CFG="bash ./scripts/config"
+
 # ==========================================
-# 2. ตั้งค่าตัวแปร Compiler ตามที่ผู้ใช้เลือก
+# 3. กำหนดเงื่อนไข Compiler และจัดการ CONFIG
 # ==========================================
 if [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" && "$PROPELLER" == "user_propeller" ]]; then
     export LLVM=1
@@ -216,37 +232,31 @@ if [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" && "$PROPELLER" == 
     export LD_PROFILE="kernel_prop_ld_profile.txt"
     export PROP_PREFIX="kernel_prop"
 
+    $CFG --enable AUTOFDO_CLANG
+    $CFG --enable AUTOFDO_CLANG_STEPTWO
+    $CFG --enable PROPELLER_CLANG
+
+    $CFG --enable RANDOMIZE_BASE
+
+    $CFG --disable DEBUG_INFO            
+    $CFG --disable PERF_EVENTS
+    $CFG --disable DEBUG_FS
+    $CFG --disable FRAME_POINTER
+
+    $CFG --disable FTRACE
+    $CFG --disable TRACING
+    $CFG --disable PAGE_POISONING
+    $CFG --disable KFENCE
+    $CFG --disable SCHEDSTATS
+    $CFG --disable LATENCYTOP
+    $CFG --disable DEBUG_WX
+
     ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
         KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
         KCONFIG_OVERWRITECONFIG=1 \
         LLVM=1 LLVM_IAS=1 \
-        CLANG_AUTOFDO_PROFILE=$(pwd)/perf01.afdo \
+        CLANG_AUTOFDO_PROFILE=$(pwd)/profile71v14.afdo \
         CLANG_PROPELLER_PROFILE_PREFIX=$(pwd)/${PROP_PREFIX} \
-        bindeb-pkg"
-
-elif [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" ]]; then
-    export LLVM=1
-    export LLVM_IAS=1
-    export CC=$tool/bin/clang
-    export CXX=$tool/bin/clang++
-    export HOSTCC=$tool/bin/clang
-    export HOSTCXX=$tool/bin/clang++
-    export LD=$tool/bin/ld.lld
-    export AR=$tool/bin/llvm-ar
-    export NM=$tool/bin/llvm-nm
-    export STRIP=$tool/bin/llvm-strip
-    export OBJCOPY=$tool/bin/llvm-objcopy
-    export OBJDUMP=$tool/bin/llvm-objdump
-    export READELF=$tool/bin/llvm-readelf
-    export HOSTAR=$tool/bin/llvm-ar
-    export HOSTLD=$tool/bin/ld.lld
-    export KCFLAGS="-fbasic-block-address-map"
-
-    ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
-        KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
-        KCONFIG_OVERWRITECONFIG=1 \
-        LLVM=1 LLVM_IAS=1 \
-        CLANG_AUTOFDO_PROFILE=$(pwd)/perf01.afdo \
         bindeb-pkg"
 
 elif [[ "$COMPILER" == "clang" ]]; then
@@ -265,6 +275,24 @@ elif [[ "$COMPILER" == "clang" ]]; then
     export READELF=$tool/bin/llvm-readelf
     export HOSTAR=$tool/bin/llvm-ar
     export HOSTLD=$tool/bin/ld.lld
+    export KCFLAGS="-fbasic-block-address-map"
+
+    $CFG --enable AUTOFDO_CLANG
+    $CFG --disable AUTOFDO_CLANG_STEPTWO
+    $CFG --enable PROPELLER_CLANG       
+    $CFG --enable DEBUG_INFO            
+    $CFG --enable PERF_EVENTS
+    $CFG --enable DEBUG_FS
+    $CFG --enable FRAME_POINTER
+
+    $CFG --disable FTRACE
+    $CFG --disable TRACING
+    $CFG --disable PAGE_POISONING
+    $CFG --disable KFENCE
+    $CFG --disable SCHEDSTATS
+    $CFG --disable LATENCYTOP
+    $CFG --disable DEBUG_WX
+    $CFG --disable RANDOMIZE_BASE
 
     ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
         KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
@@ -289,6 +317,10 @@ else
     export HOSTAR=$tool/bin/ar
     export HOSTLD=$tool/bin/ld
 
+    $CFG --disable AUTOFDO_CLANG
+    $CFG --disable AUTOFDO_CLANG_STEPTWO
+    $CFG --disable PROPELLER_CLANG
+
     ACTIVE_BUILD="KDEB_NO_SOURCE_PACKAGE=1 NO_SOURCE=1 \
         KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
         KCONFIG_OVERWRITECONFIG=1 \
@@ -296,12 +328,13 @@ else
 fi
 
 # ==========================================
-# 3. เตรียมไฟล์ Config
+# 4. ซิงค์โครงสร้าง `.config` ให้สมบูรณ์
 # ==========================================
-cp custom_config .config
+echo "[INFO] กำลังอัปเดตและคำนวณ Dependencies ใน .config..."
+make olddefconfig > /dev/null
 
 # ==========================================
-# 4. ฟังก์ชันตรวจสอบการทำงาน
+# 5. ฟังก์ชันตรวจสอบสภาพแวดล้อม
 # ==========================================
 check_compiler() {
     echo "----------------------------------------------------"
@@ -332,7 +365,7 @@ check_compiler() {
 }
 
 # ==========================================
-# 5. เริ่มกระบวนการ Build
+# 6. เริ่มกระบวนการ Build
 # ==========================================
 check_compiler
 
