@@ -945,11 +945,11 @@ endif
 ifdef CONFIG_AUTOFDO_CLANG_STEPTWO
 KBUILD_CFLAGS += -fprofile-sample-use=$(CLANG_AUTOFDO_PROFILE)
 KBUILD_CFLAGS += -fsample-profile-use-profi
-KBUILD_CFLAGS += -fprofile-sample-accurate
-KBUILD_CFLAGS += -fsplit-machine-functions
+#KBUILD_CFLAGS += -fprofile-sample-accurate
+#KBUILD_CFLAGS += -fsplit-machine-functions
 endif
 
-KBUILD_CFLAGS += -mllvm -enable-ext-tsp-block-placement=1
+#KBUILD_CFLAGS += -mllvm -enable-ext-tsp-block-placement=1
 endif # !KBUILD_EXTMOD
 
 # Always set `debug-assertions` and `overflow-checks` because their default
@@ -1113,7 +1113,7 @@ ifdef CONFIG_LTO_CLANG
 ifdef CONFIG_LTO_CLANG_THIN
 CC_FLAGS_LTO := -flto=thin -fsplit-lto-unit
 KBUILD_LDFLAGS += --thinlto-cache-dir=$(extmod_prefix).thinlto-cache
-KBUILD_LDFLAGS += -mllvm -import-instr-limit=20
+KBUILD_LDFLAGS += -mllvm -import-instr-limit=5
 else
 CC_FLAGS_LTO := -flto
 endif
