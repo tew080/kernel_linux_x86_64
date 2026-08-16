@@ -39,6 +39,18 @@
 #sudo perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -c 250007 -j any,k -a -m 64M -- sleep 300
 #
 #stress-ng --cpu 0 --schedmix 4 --vm 4 --vm-bytes 50% --mmap 4 --hdd 2 --hdd-bytes 10G --hdd-opts direct --timeout 300s --metrics-brief
+#sudo perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -c 250007 -j any,k -a -m 64M -- stress-ng \
+#  --cpu 0 --cpu-method all \
+#  --schedmix 0 --context 0 \
+#  --vm 4 --vm-bytes 80% --vm-method all \
+#  --swap 4 --swap-ops 500000 \
+#  --mmap 4 --dentry 4 --open 4 \
+#  --dir 4 --fallocate 4 --hdd 2 --hdd-bytes 10G --io 4 \
+#  --io-uring 4 \
+#  --sock 4 --pipe 4 --futex 4 --epoll 4 \
+#  --procfs 2 --sysfs 2 \
+#  --timer 4 \
+#  --timeout 300s --metrics-brief
 # 3
 #sudo cp /proc/kallsyms kernel.kallsyms
 #sudo perf script -i perf.data --show-mmap-events -F ip,brstack > perf.script
@@ -255,7 +267,7 @@ if [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" && "$PROPELLER" == 
         KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
         KCONFIG_OVERWRITECONFIG=1 \
         LLVM=1 LLVM_IAS=1 \
-        CLANG_AUTOFDO_PROFILE=$(pwd)/profile71v14.afdo \
+        CLANG_AUTOFDO_PROFILE=$(pwd)/all71v16.afdo \
         CLANG_PROPELLER_PROFILE_PREFIX=$(pwd)/${PROP_PREFIX} \
         bindeb-pkg"
 
