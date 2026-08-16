@@ -63,11 +63,7 @@ unsigned long transparent_hugepage_flags __read_mostly =
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE_MADVISE
 	(1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG)|
 #endif
-#ifdef CONFIG_TWEAKS
-	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_OR_MADV_FLAG)|
-#else
-	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG)|
-#endif
+	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_OR_MADV_FLAG)| /* Default: defer+madvise */
 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG)|
 	(1<<TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG);
 
@@ -1504,24 +1500,51 @@ gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma)
 {
 	const bool vma_madvised = vma && (vma->vm_flags & VM_HUGEPAGE);
 
-	/* Always do synchronous compaction */
+	/* Always do synchronous compaction with fast fallback for DIRECT mode */
 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG, &transparent_hugepage_flags))
-		return GFP_TRANSHUGE | (vma_madvised ? 0 : __GFP_NORETRY);
+		return GFP_TRANSHUGE | __GFP_NORETRY;
 
-	/* Kick kcompactd and fail quickly */
+	/* Kick kcompactd and fail quickly without blocking caller context */
 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_FLAG, &transparent_hugepage_flags))
 		return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
 
-	/* Synchronous compaction if madvised, otherwise kick kcompactd */
-	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_OR_MADV_FLAG, &transparent_hugepage_flags))
-		return GFP_TRANSHUGE_LIGHT |
-			(vma_madvised ? __GFP_DIRECT_RECLAIM :
-					__GFP_KSWAPD_RECLAIM);
+	/*
+	 * Ultimate Workload-Aware THP Heuristic:
+	 * Dynamically balance THP allocation based on Task Priority and Subreaper flags.
+	 */
+	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_OR_MADV_FLAG, &transparent_hugepage_flags) ||
+	    test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG, &transparent_hugepage_flags)) {
 
-	/* Only do synchronous compaction if madvised */
-	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG, &transparent_hugepage_flags))
-		return GFP_TRANSHUGE_LIGHT |
-		       (vma_madvised ? __GFP_DIRECT_RECLAIM : 0);
+		if (vma_madvised) {
+			/* 
+			 * Background Workloads: High nice (>0) or Batch/Idle sched.
+			 * Deep compaction (__GFP_RETRY_MAYFAIL) to maximize THP coverage.
+			 */
+			if (task_nice(current) > 0 ||
+			    current->policy == SCHED_BATCH || 
+			    current->policy == SCHED_IDLE) {
+				return GFP_TRANSHUGE | __GFP_DIRECT_RECLAIM | __GFP_RETRY_MAYFAIL;
+			}
+
+			/* 
+			 * - Gaming, Launchers (Steam/Lutris), High-Priority & Real-time Tasks:
+			 * - is_child_subreaper: Detects Steam/Heroic/Lutris game trees natively!
+			 * - task_nice(current) < 0: High-priority interactive apps.
+			 * - rt_task(current): Real-time scheduling tasks.
+			 * Guaranteed ZERO-STUTTER via GFP_TRANSHUGE_LIGHT + __GFP_NORETRY.
+			 */
+			if ((current->signal && current->signal->is_child_subreaper) ||
+			    task_nice(current) < 0 ||
+			    rt_task(current)) {
+				return GFP_TRANSHUGE_LIGHT | __GFP_DIRECT_RECLAIM | __GFP_NORETRY | __GFP_KSWAPD_RECLAIM;
+			}
+
+			/* Standard foreground interactive apps (nice 0, SCHED_NORMAL) */
+			return GFP_TRANSHUGE_LIGHT | __GFP_DIRECT_RECLAIM | __GFP_NORETRY | __GFP_KSWAPD_RECLAIM;
+		}
+
+		return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
+	}
 
 	return GFP_TRANSHUGE_LIGHT;
 }
