@@ -202,42 +202,62 @@ static bool should_dump_unreclaim_slab(void)
  */
 long oom_badness(struct task_struct *p, unsigned long totalpages)
 {
-	long points;
-	long adj;
+ 	long points;
+ 	long adj;
+	int nice;
+	int policy;
 
-	if (oom_unkillable_task(p))
-		return LONG_MIN;
+ 	if (oom_unkillable_task(p))
+ 		return LONG_MIN;
 
-	p = find_lock_task_mm(p);
-	if (!p)
-		return LONG_MIN;
+ 	p = find_lock_task_mm(p);
+ 	if (!p)
+ 		return LONG_MIN;
+
+ 	/*
+ 	 * Do not even consider tasks which are explicitly marked oom
+ 	 * unkillable or have been already oom reaped or the are in
+ 	 * the middle of vfork
+ 	 */
+ 	adj = (long)p->signal->oom_score_adj;
+ 	if (adj == OOM_SCORE_ADJ_MIN ||
+ 			mm_flags_test(MMF_OOM_SKIP, p->mm) ||
+ 			in_vfork(p)) {
+ 		task_unlock(p);
+ 		return LONG_MIN;
+ 	}
 
 	/*
-	 * Do not even consider tasks which are explicitly marked oom
-	 * unkillable or have been already oom reaped or the are in
-	 * the middle of vfork
+	 * Snapshot scheduler attributes while task_lock() is held.
+	 * Do not dereference task_struct after task_unlock().
 	 */
-	adj = (long)p->signal->oom_score_adj;
-	if (adj == OOM_SCORE_ADJ_MIN ||
-			mm_flags_test(MMF_OOM_SKIP, p->mm) ||
-			in_vfork(p)) {
-		task_unlock(p);
-		return LONG_MIN;
-	}
+	nice = task_nice(p);
+	policy = p->policy;
 
-	/*
-	 * The baseline for the badness score is the proportion of RAM that each
-	 * task's rss, pagetable and swap space use.
-	 */
-	points = get_mm_rss_sum(p->mm) + get_mm_counter_sum(p->mm, MM_SWAPENTS) +
-		mm_pgtables_bytes(p->mm) / PAGE_SIZE;
-	task_unlock(p);
+ 	/*
+ 	 * The baseline for the badness score is the proportion of RAM that each
+ 	 * task's rss, pagetable and swap space use.
+ 	 */
+ 	points = get_mm_rss_sum(p->mm) + get_mm_counter_sum(p->mm, MM_SWAPENTS) +
+ 		mm_pgtables_bytes(p->mm) / PAGE_SIZE;
+ 	task_unlock(p);
 
-	/* Normalize to oom_score_adj units */
-	adj *= totalpages / 1000;
-	points += adj;
+ 	/* Normalize to oom_score_adj units */
+ 	adj *= totalpages / 1000;
+ 	points += adj;
 
-	return points;
+ 	/*
+ 	 * Smart Heuristic for Workload Focus:
+	 * Increase the OOM score of lower-priority workload classes so they
+	 * are preferred as victims over interactive workloads.
+ 	 */
+	if (nice > 0)
+		points += (points * nice) / 100;
+
+	if (policy == SCHED_BATCH || policy == SCHED_IDLE)
+ 		points += points / 5;
+
+ 	return points;
 }
 
 static const char * const oom_constraint_text[] = {
