@@ -200,12 +200,13 @@ static bool should_dump_unreclaim_slab(void)
  * predictable as possible.  The goal is to return the highest value for the
  * task consuming the most memory to avoid subsequent oom failures.
  */
-long oom_badness(struct task_struct *p, unsigned long totalpages)
-{
- 	long points;
+ long oom_badness(struct task_struct *p, unsigned long totalpages)
+ {
+	long points;
+	long memory_points;
  	long adj;
-	int nice;
-	int policy;
+ 	int nice;
+ 	int policy;
 
  	if (oom_unkillable_task(p))
  		return LONG_MIN;
@@ -227,38 +228,42 @@ long oom_badness(struct task_struct *p, unsigned long totalpages)
  		return LONG_MIN;
  	}
 
-	/*
-	 * Snapshot scheduler attributes while task_lock() is held.
-	 * Do not dereference task_struct after task_unlock().
-	 */
-	nice = task_nice(p);
-	policy = p->policy;
+ 	/*
+ 	 * Snapshot scheduler attributes while task_lock() is held.
+ 	 * Do not dereference task_struct after task_unlock().
+ 	 */
+ 	nice = task_nice(p);
+ 	policy = p->policy;
 
  	/*
  	 * The baseline for the badness score is the proportion of RAM that each
  	 * task's rss, pagetable and swap space use.
  	 */
- 	points = get_mm_rss_sum(p->mm) + get_mm_counter_sum(p->mm, MM_SWAPENTS) +
+	memory_points = get_mm_rss_sum(p->mm) +
+		get_mm_counter_sum(p->mm, MM_SWAPENTS) +
  		mm_pgtables_bytes(p->mm) / PAGE_SIZE;
  	task_unlock(p);
+
+	/*
+	 * Prefer memory-heavy background workloads, but keep the bias bounded.
+	 * Workload classification must not be able to outweigh a substantially
+	 * larger memory footprint.
+	 */
+	points = memory_points;
+
+	if (nice > 0)
+		points += min(memory_points / 10,
+			      memory_points * (long)nice / 190);
+
+	if (policy == SCHED_BATCH || policy == SCHED_IDLE)
+		points += memory_points / 10;
 
  	/* Normalize to oom_score_adj units */
  	adj *= totalpages / 1000;
  	points += adj;
 
- 	/*
- 	 * Smart Heuristic for Workload Focus:
-	 * Increase the OOM score of lower-priority workload classes so they
-	 * are preferred as victims over interactive workloads.
- 	 */
-	if (nice > 0)
-		points += (points * nice) / 100;
-
-	if (policy == SCHED_BATCH || policy == SCHED_IDLE)
- 		points += points / 5;
-
  	return points;
-}
+ }
 
 static const char * const oom_constraint_text[] = {
 	[CONSTRAINT_NONE] = "CONSTRAINT_NONE",
