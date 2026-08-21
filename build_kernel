@@ -267,7 +267,7 @@ if [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" && "$PROPELLER" == 
         KBUILD_NO_SYNC_CONFIG=1 KCONFIG_NOTIMESTAMP=1 \
         KCONFIG_OVERWRITECONFIG=1 \
         LLVM=1 LLVM_IAS=1 \
-        CLANG_AUTOFDO_PROFILE=$(pwd)/all71v16.afdo \
+        CLANG_AUTOFDO_PROFILE=$(pwd)/perf01.afdo \
         CLANG_PROPELLER_PROFILE_PREFIX=$(pwd)/${PROP_PREFIX} \
         bindeb-pkg"
 
