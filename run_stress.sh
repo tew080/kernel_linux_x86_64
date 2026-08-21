@@ -1,0 +1,1 @@
+sudo perf record -e BR_INST_RETIRED.NEAR_TAKEN:k -c 250007 -j any,k -a -m 128M -o /tmp/perf.data -- stress-ng --cpu 0 --cpu-method all --context 0 --vm 2 --vm-bytes 50% --vm-method all --mmap 2 --dentry 2 --open 2 --dir 2 --fallocate 2 --hdd 2 --hdd-bytes 1G --io 2 --sock 4 --pipe 4 --futex 4 --epoll 4 --timer 4 --timeout 800s --metrics-brief
