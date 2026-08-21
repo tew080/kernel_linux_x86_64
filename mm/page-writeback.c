@@ -107,14 +107,22 @@ static unsigned long vm_dirty_bytes;
 /*
  * The interval between `kupdate'-style writebacks
  */
+#ifdef CONFIG_TWEAKS
+unsigned int dirty_writeback_interval = 2 * 100; 
+#else
 unsigned int dirty_writeback_interval = 5 * 100; /* centiseconds */
+#endif
 
 EXPORT_SYMBOL_GPL(dirty_writeback_interval);
 
 /*
  * The longest time for which data is allowed to remain dirty
  */
+#ifdef CONFIG_TWEAKS
+unsigned int dirty_expire_interval = 10 * 100; 
+#else
 unsigned int dirty_expire_interval = 30 * 100; /* centiseconds */
+#endif
 
 /* End of sysctl-exported parameters */
 
@@ -2293,14 +2301,22 @@ static const struct ctl_table vm_page_writeback_sysctls[] = {
 		.procname   = "dirty_writeback_centisecs",
 		.data       = &dirty_writeback_interval,
 		.maxlen     = sizeof(dirty_writeback_interval),
+#ifdef CONFIG_TWEAKS
+		.mode       = 0444,
+#else
 		.mode       = 0644,
+#endif
 		.proc_handler   = dirty_writeback_centisecs_handler,
 	},
 	{
 		.procname   = "dirty_expire_centisecs",
 		.data       = &dirty_expire_interval,
 		.maxlen     = sizeof(dirty_expire_interval),
+#ifdef CONFIG_TWEAKS
+		.mode       = 0444,
+#else
 		.mode       = 0644,
+#endif
 		.proc_handler   = proc_dointvec_minmax,
 		.extra1     = SYSCTL_ZERO,
 	},
