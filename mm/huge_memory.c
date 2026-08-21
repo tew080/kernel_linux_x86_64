@@ -40,6 +40,7 @@
 #include <linux/pgalloc.h>
 #include <linux/pgalloc_tag.h>
 #include <linux/pagewalk.h>
+#include <linux/sched/rt.h>
 
 #include <asm/tlb.h>
 #include "internal.h"
@@ -1496,58 +1497,43 @@ vm_fault_t do_huge_pmd_device_private(struct vm_fault *vmf)
  *	    available
  * never: never stall for any thp allocation
  */
-gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma)
-{
-	const bool vma_madvised = vma && (vma->vm_flags & VM_HUGEPAGE);
+ gfp_t vma_thp_gfp_mask(struct vm_area_struct *vma)
+ {
+ 	const bool vma_madvised = vma && (vma->vm_flags & VM_HUGEPAGE);
 
-	/* Always do synchronous compaction with fast fallback for DIRECT mode */
-	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG, &transparent_hugepage_flags))
-		return GFP_TRANSHUGE | __GFP_NORETRY;
+ 	/* Always do synchronous compaction */
+ 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_DIRECT_FLAG,
+ 		     &transparent_hugepage_flags))
+ 		return GFP_TRANSHUGE |
+ 		       (vma_madvised ? 0 : __GFP_NORETRY);
 
-	/* Kick kcompactd and fail quickly without blocking caller context */
-	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_FLAG, &transparent_hugepage_flags))
-		return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
+ 	/* Kick kcompactd and fail quickly without blocking caller context */
+ 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_FLAG,
+ 		     &transparent_hugepage_flags))
+ 		return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
 
-	/*
-	 * Ultimate Workload-Aware THP Heuristic:
-	 * Dynamically balance THP allocation based on Task Priority and Subreaper flags.
-	 */
-	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_OR_MADV_FLAG, &transparent_hugepage_flags) ||
-	    test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG, &transparent_hugepage_flags)) {
+ 	if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_KSWAPD_OR_MADV_FLAG,
+ 		     &transparent_hugepage_flags) ||
+ 	    test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG,
+ 		     &transparent_hugepage_flags)) {
 
-		if (vma_madvised) {
-			/* 
-			 * Background Workloads: High nice (>0) or Batch/Idle sched.
-			 * Deep compaction (__GFP_RETRY_MAYFAIL) to maximize THP coverage.
-			 */
-			if (task_nice(current) > 0 ||
-			    current->policy == SCHED_BATCH || 
-			    current->policy == SCHED_IDLE) {
-				return GFP_TRANSHUGE | __GFP_DIRECT_RECLAIM | __GFP_RETRY_MAYFAIL;
-			}
+ 		if (vma_madvised) {
+			if (task_nice(current) != 0 || rt_task(current))
+ 				return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
 
-			/* 
-			 * - Gaming, Launchers (Steam/Lutris), High-Priority & Real-time Tasks:
-			 * - is_child_subreaper: Detects Steam/Heroic/Lutris game trees natively!
-			 * - task_nice(current) < 0: High-priority interactive apps.
-			 * - rt_task(current): Real-time scheduling tasks.
-			 * Guaranteed ZERO-STUTTER via GFP_TRANSHUGE_LIGHT + __GFP_NORETRY.
-			 */
-			if ((current->signal && current->signal->is_child_subreaper) ||
-			    task_nice(current) < 0 ||
-			    rt_task(current)) {
-				return GFP_TRANSHUGE_LIGHT | __GFP_DIRECT_RECLAIM | __GFP_NORETRY | __GFP_KSWAPD_RECLAIM;
-			}
+ 			return GFP_TRANSHUGE_LIGHT |
+ 			       __GFP_DIRECT_RECLAIM | __GFP_NORETRY;
+ 		}
 
-			/* Standard foreground interactive apps (nice 0, SCHED_NORMAL) */
-			return GFP_TRANSHUGE_LIGHT | __GFP_DIRECT_RECLAIM | __GFP_NORETRY | __GFP_KSWAPD_RECLAIM;
-		}
+ 		if (test_bit(TRANSPARENT_HUGEPAGE_DEFRAG_REQ_MADV_FLAG,
+ 			     &transparent_hugepage_flags))
+			return GFP_TRANSHUGE_LIGHT;
 
 		return GFP_TRANSHUGE_LIGHT | __GFP_KSWAPD_RECLAIM;
-	}
+ 	}
 
-	return GFP_TRANSHUGE_LIGHT;
-}
+ 	return GFP_TRANSHUGE_LIGHT;
+ }
 
 /* Caller must hold page table lock. */
 static void set_huge_zero_folio(pgtable_t pgtable, struct mm_struct *mm,
