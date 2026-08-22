@@ -894,6 +894,10 @@ struct task_struct {
 #endif /* CONFIG_SCHED_PDS */
 	/* sched_clock time spent running */
 	u64				sched_time;
+#ifdef CONFIG_SCHED_BMQ_BURST
+    u8                 prev_burst_penalty;
+    u64                burst_time;
+#endif
 #else /* !CONFIG_SCHED_ALT */
 	struct sched_entity		se;
 	struct sched_rt_entity		rt;

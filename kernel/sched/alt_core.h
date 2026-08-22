@@ -105,4 +105,8 @@ extern struct rq *move_queued_task(struct rq *rq, struct rq_flags *rf,
 
 DECLARE_STATIC_CALL(sched_idle_select_func, cpumask_and);
 
+#ifdef CONFIG_SCHED_BMQ_BURST
+DECLARE_STATIC_KEY_TRUE(sched_bmq_burst_enabled);
+#endif
+
 #endif /* _KERNEL_SCHED_ALT_CORE_H */

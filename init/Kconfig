@@ -984,6 +984,15 @@ endchoice
 
 endif
 
+config SCHED_BMQ_BURST
+    bool "Burst-aware wake-boost limiter for BMQ"
+    depends on SCHED_BMQ
+    help
+      Adjust BMQ wake-boost by subtracting penalty based on burst time
+      (accumulated CPU runtime since last reset). Helps separate interactive
+      tasks from batch/CPU-hogs effectively without destroying BMQ's original
+      timeslice deboost semantics.
+	  
 endmenu
 
 #

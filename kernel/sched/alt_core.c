@@ -663,9 +663,94 @@ static inline void __dequeue_task(struct task_struct *p, struct rq *rq)
 	__SCHED_DEQUEUE_TASK(p, rq, flags, update_sched_preempt_mask(rq));
 }
 
+#ifdef CONFIG_SCHED_BMQ_BURST
+#define BMQ_BURST_FP                8
+#define BMQ_BURST_PENALTY_OFFSET    24
+#define BMQ_BURST_PENALTY_SCALE     1536
+#define BMQ_BURST_PENALTY_MAX       MAX_PRIORITY_ADJ
+
+DEFINE_STATIC_KEY_TRUE(sched_bmq_burst_enabled);
+
+static unsigned int __read_mostly sched_burst_penalty_offset = BMQ_BURST_PENALTY_OFFSET;
+static unsigned int __read_mostly sched_burst_penalty_scale = BMQ_BURST_PENALTY_SCALE;
+static unsigned int __read_mostly sched_burst_smoothness_shift = 1;
+
+static const unsigned int sched_burst_penalty_offset_max = 63;
+static const unsigned int sched_burst_penalty_scale_max = 4096;
+static const unsigned int sched_burst_smoothness_shift_max = 8;
+
+static inline u32 bmq_log2p1_u64_u32fp(u64 v)
+{
+    u32 exponent, mantissa;
+    int clz;
+
+    if (!v)
+        return 0;
+
+    clz = __builtin_clzll(v);
+    exponent = 64 - clz;
+    mantissa = (u32)(((v << clz) << 1) >> (64 - BMQ_BURST_FP));
+
+    return (exponent << BMQ_BURST_FP) | mantissa;
+}
+
+static inline u32 bmq_calc_burst_penalty(u64 burst_time)
+{
+    u32 greed;
+    s32 diff;
+    u32 penalty;
+    u32 scaled;
+
+    greed = bmq_log2p1_u64_u32fp(burst_time);
+
+    diff = (s32)greed - ((s32)sched_burst_penalty_offset << BMQ_BURST_FP);
+    penalty = max(diff, 0);
+    scaled = (penalty * sched_burst_penalty_scale) >> 10;
+
+    return min(scaled, (u32)BMQ_BURST_PENALTY_MAX);
+}
+
+/*
+ * Fast decay, slow growth.
+ * Prevent stale burst penalties while avoiding abrupt penalty growth.
+ */
+static inline u32 bmq_smooth_penalty(u32 curr_penalty, u32 previous)
+{
+    u32 shift = min(sched_burst_smoothness_shift, 8U);
+
+    if (curr_penalty <= previous)
+        return curr_penalty;
+
+    return previous + ((curr_penalty - previous + (1U << shift) - 1) >> shift);
+}
+
+static inline void restart_burst_bmq(struct task_struct *p)
+{
+    u32 penalty;
+
+    if (!static_branch_likely(&sched_bmq_burst_enabled)) {
+        p->burst_time = 0;
+        p->prev_burst_penalty = 0;
+        return;
+    }
+
+    penalty = bmq_calc_burst_penalty(p->burst_time);
+
+    if (sched_burst_smoothness_shift)
+        penalty = bmq_smooth_penalty(penalty, p->prev_burst_penalty);
+
+    p->prev_burst_penalty = min_t(u32, penalty, BMQ_BURST_PENALTY_MAX);
+    p->burst_time = 0;
+}
+#endif /* CONFIG_SCHED_BMQ_BURST */
+
 static inline void dequeue_task(struct task_struct *p, struct rq *rq, int flags)
 {
 	__dequeue_task(p, rq);
+#ifdef CONFIG_SCHED_BMQ_BURST
+    if (flags & DEQUEUE_SLEEP)
+        restart_burst_bmq(p);
+#endif
 	sub_nr_running(rq, 1);
 }
 
@@ -2939,7 +3024,10 @@ static inline void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->utime			= 0;
 	p->stime			= 0;
 	p->sched_time			= 0;
-
+#ifdef CONFIG_SCHED_BMQ_BURST
+    p->prev_burst_penalty  = 0;
+    p->burst_time          = 0;
+#endif
 #ifdef CONFIG_SCHEDSTATS
 	/* Even if schedstat is disabled, there should not be garbage */
 	memset(&p->stats, 0, sizeof(p->stats));
@@ -3118,6 +3206,36 @@ static int sysctl_schedstats(const struct ctl_table *table, int write, void *buf
 #endif /* CONFIG_PROC_SYSCTL */
 #endif /* CONFIG_SCHEDSTATS */
 
+#ifdef CONFIG_PROC_SYSCTL
+static int sysctl_sched_bmq_burst(const struct ctl_table *table,
+                  int write, void *buffer,
+                  size_t *lenp, loff_t *ppos)
+{
+    struct ctl_table t;
+    int err;
+    int state = static_branch_likely(&sched_bmq_burst_enabled);
+
+    if (write && !capable(CAP_SYS_ADMIN))
+        return -EPERM;
+
+    t = *table;
+    t.data = &state;
+
+    err = proc_dointvec_minmax(&t, write, buffer, lenp, ppos);
+    if (err < 0)
+        return err;
+
+    if (write) {
+        if (state)
+            static_branch_enable(&sched_bmq_burst_enabled);
+        else
+            static_branch_disable(&sched_bmq_burst_enabled);
+    }
+
+    return err;
+}
+#endif /* CONFIG_PROC_SYSCTL */
+
 #ifdef CONFIG_SYSCTL
 static const struct ctl_table sched_core_sysctls[] = {
 #ifdef CONFIG_SCHEDSTATS
@@ -3131,6 +3249,44 @@ static const struct ctl_table sched_core_sysctls[] = {
 		.extra2         = SYSCTL_ONE,
 	},
 #endif /* CONFIG_SCHEDSTATS */
+#ifdef CONFIG_SCHED_BMQ_BURST
+    {
+        .procname    = "sched_bmq_burst",
+        .data        = NULL,
+        .maxlen        = sizeof(unsigned int),
+        .mode        = 0644,
+        .proc_handler    = sysctl_sched_bmq_burst,
+        .extra1        = SYSCTL_ZERO,
+        .extra2        = SYSCTL_ONE,
+    },
+    {
+        .procname    = "sched_bmq_burst_penalty_offset",
+        .data        = &sched_burst_penalty_offset,
+        .maxlen        = sizeof(unsigned int),
+        .mode        = 0644,
+        .proc_handler    = proc_douintvec_minmax,
+        .extra1        = SYSCTL_ZERO,
+        .extra2        = (void *)&sched_burst_penalty_offset_max,
+    },
+    {
+        .procname    = "sched_bmq_burst_penalty_scale",
+        .data        = &sched_burst_penalty_scale,
+        .maxlen        = sizeof(unsigned int),
+        .mode        = 0644,
+        .proc_handler    = proc_douintvec_minmax,
+        .extra1        = SYSCTL_ONE,
+        .extra2        = (void *)&sched_burst_penalty_scale_max,
+    },
+    {
+        .procname    = "sched_bmq_burst_smoothness_shift",
+        .data        = &sched_burst_smoothness_shift,
+        .maxlen        = sizeof(unsigned int),
+        .mode        = 0644,
+        .proc_handler    = proc_douintvec_minmax,
+        .extra1        = SYSCTL_ZERO,
+        .extra2        = (void *)&sched_burst_smoothness_shift_max,
+    },
+#endif /* CONFIG_SCHED_BMQ_BURST */
 };
 static int __init sched_core_sysctl_init(void)
 {
@@ -3800,6 +3956,9 @@ static inline void update_curr(struct rq *rq, struct task_struct *p)
 	s64 ns = rq->clock_task - p->last_ran;
 
 	p->sched_time += ns;
+#ifdef CONFIG_SCHED_BMQ_BURST
+    p->burst_time += ns;
+#endif
 	cgroup_account_cputime(p, ns);
 	account_group_exec_runtime(p, ns);
 
