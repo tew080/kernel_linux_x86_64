@@ -1910,34 +1910,51 @@ static int sysctl_extfrag_threshold = 500;
 static int __read_mostly sysctl_compact_memory;
 
 /*
- * เดิม compaction_dynamic_tuning() switch tier แบบทันที
- * ไม่มี ramping — พอ load ตกจาก "หนัก" ไป "ว่าง" ทันที proactiveness
- * จะกระโดดไปค่าสูงสุดในติ๊กเดียว (2 วิ) ทำให้ kcompactd ทำงานเต็มแรง
- * พอดีกับจังหวะที่ RAM เพิ่งว่างมาก (เช่นปิดโปรแกรมกินแรมหนัก) ซึ่ง
- * มักตรงกับจังหวะที่ user กลับมาคลิกใช้งานเครื่องพอดี (trigger
- * swap-in decompress) — CPU cycle ที่ต้องใช้ decompress ไปชนกับ
- * kcompactd ที่วิ่งเต็มแรงพอดี ทำให้กระตุกเห็นชัด ทั้งที่ swap-in
- * เดี่ยวๆ ควรเบามากจนไม่รู้สึก
+ * Dynamic tuning of proactive compaction.
  *
- * แก้ด้วย 2 ชั้น: (1) ramp ค่าเข้าใกล้ target แบบค่อยเป็นค่อยไป
- * ไม่กระโดดเต็มสเกลในติ๊กเดียว (2) cooldown ก่อนจะ "ขยัน" ขึ้น
- * (ผ่อนคลาย pressure) กันกรณี load ร่วงแค่ชั่วครู่เดี๋ยวเดียวแล้ว
- * เด้งกลับมาหนักอีก — เหมือน SWAP_CLUSTER_RELAX_INTERVAL ที่ใช้กับ
- * page_cluster ไปก่อนหน้า ไม่ต้อง throttle ทิศทาง "ลดลง" (บีบตัวเอง
- * ให้เบาลงทำได้ทันทีเสมอ ปลอดภัยกว่าไม่ต้องรอ)
+ * Under memory pressure, kcompactd is woken very frequently via
+ * boost_watermark()/pageblock fallback. Tuning must therefore:
+ *  (1) early-exit unless COMPACTION_TUNE_INTERVAL has elapsed, so we
+ *      do real work at most ~2 times per second no matter how often
+ *      should_proactive_compact_node() is called;
+ *  (2) never WRITE the admin-visible sysctls — keep results in
+ *      separate "effective" variables (same invariant as other
+ *      load-aware knobs in this tree);
+ *  (3) ramp up (relax) with cooldown; tighten immediately when load
+ *      rises;
+ *  (4) cap effective proactiveness by the admin sysctl (0 disables).
  */
 #define COMPACTION_PROACTIVE_RAMP_STEP		5   /* ต่อ tick (2 วิ) */
 #define COMPACTION_RELAX_COOLDOWN		(10 * HZ)
+#define COMPACTION_TUNE_INTERVAL  (HZ / 2)  /* ≤ 2 ครั้ง/วินาที */
+
+/* Effective values used by kcompactd paths — not the admin sysctls. */
+static unsigned int compaction_eff_proactiveness = 20;
+static int compaction_eff_extfrag = 500;
 
 static unsigned long compaction_last_relax_jif;
+static unsigned long compaction_last_tune_jif;
 
 static void compaction_dynamic_tuning(void)
 {
-	unsigned long load = avenrun[0] >> FSHIFT;
-	unsigned int ncpu = num_online_cpus();
+	unsigned long now = jiffies;
+	unsigned long load;
+	unsigned int ncpu;
 	unsigned int target_proactiveness;
 	int target_extfrag;
 	unsigned int cur;
+	unsigned int admin;
+
+	/*
+	 * Gate first: if the interval has not elapsed, leave immediately
+	 * without touching avenrun, online CPU count, or any WRITE.
+	*/
+	if (time_before(now, compaction_last_tune_jif + COMPACTION_TUNE_INTERVAL))
+		return;
+	compaction_last_tune_jif = now;
+
+	load = avenrun[0] >> FSHIFT;
+	ncpu = num_online_cpus();
 
 	if (2 * load < ncpu) {
 		target_proactiveness = 30;
@@ -1950,15 +1967,23 @@ static void compaction_dynamic_tuning(void)
 		target_extfrag = 800;
 	}
 
-	cur = READ_ONCE(sysctl_compaction_proactiveness);
+	/*
+	 * Honour the admin sysctl as a ceiling. 0 means proactive
+	 * compaction is fully disabled.
+	*/
+	admin = READ_ONCE(sysctl_compaction_proactiveness);
+	if (!admin) {
+		WRITE_ONCE(compaction_eff_proactiveness, 0);
+		WRITE_ONCE(compaction_eff_extfrag,
+			   READ_ONCE(sysctl_extfrag_threshold));
+		return;
+	}
+	if (target_proactiveness > admin)
+		target_proactiveness = admin;
+
+	cur = READ_ONCE(compaction_eff_proactiveness);
 
 	if (target_proactiveness > cur) {
-		/*
-		 * กำลังจะ "ขยันขึ้น" (ผ่อนคลาย) — ต้องผ่าน cooldown ก่อน
-		 * กัน flapping ตอน load แกว่งสั้นๆ ไม่ใช่ pressure ที่คลี่คลาย
-		 * จริง
-		 */
-		unsigned long now = jiffies;
 
 		if (time_before(now, compaction_last_relax_jif +
 				 COMPACTION_RELAX_COOLDOWN))
@@ -1969,17 +1994,19 @@ static void compaction_dynamic_tuning(void)
 			  target_proactiveness);
 	} else if (target_proactiveness < cur) {
 		/* บีบให้เบาลง (ระบบเริ่มหนัก) ทำได้ทันทีเสมอ ไม่ throttle
-		 * เพราะการตอบสนองไวตอน "จะหนัก" สำคัญกว่าตอน "จะว่าง" */
+		 * เพราะการตอบสนองไวตอน "จะหนัก" สำคัญกว่าตอน "จะว่าง" 
+		*/
 		cur = target_proactiveness;
 	}
 
-	WRITE_ONCE(sysctl_compaction_proactiveness, cur);
-	WRITE_ONCE(sysctl_extfrag_threshold, target_extfrag);
+	WRITE_ONCE(compaction_eff_proactiveness, cur);
+	WRITE_ONCE(compaction_eff_extfrag, target_extfrag);
 
-
-	wmark_check_sustained_load();   /* เกาะ tick 2 วิเดิม ตัวมันเอง
-					  * throttle ภายในเหลือ 1 ครั้ง/นาที
-					  * และ 1 ครั้งทั้ง session อยู่แล้ว */
+	/*
+	 * Only reached after the interval gate (~2 Hz max). The helper
+	 * itself further limits to once per minute and once per session.
+	*/
+	wmark_check_sustained_load();
 }
 
 static inline void
@@ -2306,7 +2333,7 @@ static unsigned int fragmentation_score_wmark(bool low)
 {
 	unsigned int wmark_low, leeway;
 
-	wmark_low = 100U - READ_ONCE(sysctl_compaction_proactiveness);
+	wmark_low = 100U - READ_ONCE(compaction_eff_proactiveness);
 	leeway = min(10U, wmark_low / 2);
 	return low ? wmark_low : min(wmark_low + leeway, 100U);
 }
@@ -2315,15 +2342,14 @@ static bool should_proactive_compact_node(pg_data_t *pgdat)
 {
 	int wmark_high;
 
-	/* 
-     * เรียกฟังก์ชันจูนนิ่งอัตโนมัติ เพื่อปรับค่า sysctl 
-     * ตาม CPU Load ปัจจุบัน ก่อนนำค่าไปใช้ตัดสินใจ
-     */
-    compaction_dynamic_tuning();
+	/*
+	 * Refresh effective knobs (cheap early-exit inside) then decide
+	 * from the effective value, not the admin sysctl.
+	 */
+	compaction_dynamic_tuning();
 
-    /* ใช้ READ_ONCE ป้องกัน Race condition จากการอ่านค่าที่อาจเปลี่ยนแบบ Asynchronous */
-    if (!READ_ONCE(sysctl_compaction_proactiveness) || kswapd_is_running(pgdat))
-          return false;
+	if (!READ_ONCE(compaction_eff_proactiveness) || kswapd_is_running(pgdat))
+		return false;
 
 	wmark_high = fragmentation_score_wmark(false);
 	return fragmentation_score_node(pgdat) > wmark_high;

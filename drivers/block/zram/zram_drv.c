@@ -53,11 +53,14 @@ enum {
 	ZRAM_DENSITY_CRITICAL	= 2,	/* วิกฤต: บีบทั้ง idle+huge เร่งมือ */
 };
 
-#define ZRAM_DENSITY_TIGHT_PCT		25	/* MemAvailable < 25% ของ RAM ทั้งหมด */
-#define ZRAM_DENSITY_CRITICAL_PCT	10	/* < 10% ของ RAM ทั้งหมด */
-#define ZRAM_ADAPT_PERIOD		(2 * HZ)	/* เช็คทุก 2 วิ ต้นทุนต่ำมาก */
-#define ZRAM_ADAPT_BATCH_TIGHT		256
-#define ZRAM_ADAPT_BATCH_CRITICAL	2048
+#define ZRAM_DENSITY_TIGHT_PCT		20	/* MemAvailable < 20% ของ RAM ทั้งหมด */
+#define ZRAM_DENSITY_CRITICAL_PCT	8	/* < 8% ของ RAM ทั้งหมด */
+#define ZRAM_ADAPT_PERIOD_TIGHT		(4 * HZ)	/* ทุก 4 วิ ตอน TIGHT */
+#define ZRAM_ADAPT_PERIOD_CRITICAL	(6 * HZ)	/* ทุก 6 วิ ตอน CRITICAL */
+#define ZRAM_ADAPT_PERIOD_IDLE		(2 * HZ)	/* requeue ตอน NORMAL */
+#define ZRAM_ADAPT_BATCH_TIGHT		64
+#define ZRAM_ADAPT_BATCH_CRITICAL	128
+#define ZRAM_ADAPT_TIME_BUDGET_NS	(8 * NSEC_PER_MSEC) /* ~8ms / tick */
 
 /*
  * PAGES_TO_MB ไม่ใช่ macro มาตรฐานที่ header ใดๆ ที่ include ไว้ด้านบน
@@ -1838,7 +1841,7 @@ static int comp_params_store(struct zram *zram, u32 prio, s32 level,
  * ไม่ใช่ช่องให้ผู้ใช้เลือก ทุกตัวในนี้ยัง hardcode ในซอร์สเหมือนเดิม
  */
 static const char *const zram_secondary_algo_fallback[] = {
-	"zstd", "lz4hc", "deflate", NULL,
+	"lz4hc", "zstd", "deflate", NULL,
 };
 
 static void zram_setup_hardcoded_algorithms(struct zram *zram)
@@ -2454,7 +2457,7 @@ static bool highest_priority_algorithm(struct zram *zram, u32 prio)
  * จึงคงที่ไม่ขึ้นกับขนาด zram อีกต่อไป ส่วน batch เดิมยังคุมจำนวนหน้าที่
  * "บีบอัดจริง" เหมือนเดิมทุกประการ ไม่กระทบ policy อื่นใด
  */
-#define ZRAM_ADAPT_SCAN_SLOTS_PER_TICK	65536UL   /* ~256MB ต่อ tick */
+#define ZRAM_ADAPT_SCAN_SLOTS_PER_TICK	16384UL   /* ~64MB ต่อ tick */
 
 static void scan_slots_for_recompress(struct zram *zram, u32 mode, u32 prio,
 				      struct zram_pp_ctl *ctl)
@@ -2474,10 +2477,10 @@ static void scan_slots_for_recompress(struct zram *zram, u32 mode, u32 prio,
 		bool ok = true;
 
 		/*
-		 * ทุกๆ 8192 slots (~32MB) ให้เช็คและยอมคืน CPU ให้ Scheduler 
-		 * เพื่อไม่ให้กระทบ Frame Rate ของเกมหรือเกิดการดึง CPU นานเกิน 10ms
+		 * resched ถี่ขึ้น (ทุก 1024 slot ≈ 4MB) เพื่อคืน CPU ให้
++		 * interactive task เร็วขึ้น ตอน background scan
 		 */
-		if (!(index & 0x1fff))
+		if (!(index & 0x3ff))
 			cond_resched();
 
 		slot_lock(zram, index);
@@ -2642,6 +2645,7 @@ static void zram_run_recompress_pass(struct zram *zram, u32 mode, u32 prio,
 	struct zram_pp_ctl *ctl;
 	struct zram_pp_slot *pps;
 	struct page *page;
+	u64 deadline;
 
 	if (!zram->comps[prio])
 		return;
@@ -2658,8 +2662,13 @@ static void zram_run_recompress_pass(struct zram *zram, u32 mode, u32 prio,
 
 	scan_slots_for_recompress(zram, mode, prio, ctl);
 
+	/* งบเวลา wall-clock ต่อ tick — หมดแล้วหยุด เหลือให้รอบถัดไป */
+	deadline = ktime_get_ns() + ZRAM_ADAPT_TIME_BUDGET_NS;
+
 	while ((pps = select_pp_slot(ctl))) {
 		if (!max_pages)
+			break;
+		if (ktime_get_ns() >= deadline)
 			break;
 
 		slot_lock(zram, pps->index);
@@ -2682,6 +2691,7 @@ static void zram_adapt_work_fn(struct work_struct *w)
 	unsigned int level;
 	u32 mode, prio;
 	u64 batch;
+	unsigned long delay = ZRAM_ADAPT_PERIOD_IDLE;
 
 	/*
 	 * trylock ล้วน ไม่มี blocking wait เลยในฟังก์ชันนี้ — ถ้า
@@ -2709,10 +2719,22 @@ static void zram_adapt_work_fn(struct work_struct *w)
 		mode = RECOMPRESS_IDLE;
 		prio = ZRAM_SECONDARY_COMP;
 		batch = ZRAM_ADAPT_BATCH_TIGHT;
+		delay = ZRAM_ADAPT_PERIOD_TIGHT;
 	} else {
+		/*
+		 * CRITICAL: ยังบีบแค่ IDLE เป็นหลัก — HUGE ถูกเขียนสด
+		 * ด้วย primary (LZ4) อยู่แล้ว การดึง HUGE มา recompress
+		 * ตอนระบบวิกฤตมักแพงเกินคุ้มและแย่ง CPU กับ reclaim/UI
+		 * ถ้าต้องการ HUGE ด้วย ให้เปิด ZRAM_ADAPT_CRITICAL_HUGE
+		 */
+#ifdef CONFIG_ZRAM_ADAPT_CRITICAL_HUGE
 		mode = RECOMPRESS_IDLE | RECOMPRESS_HUGE;
+#else
+		mode = RECOMPRESS_IDLE;
+#endif
 		prio = ZRAM_MAX_COMPS - 1;
 		batch = ZRAM_ADAPT_BATCH_CRITICAL;
+		delay = ZRAM_ADAPT_PERIOD_CRITICAL;
 	}
 
 	/*
@@ -2742,7 +2764,7 @@ static void zram_adapt_work_fn(struct work_struct *w)
 	}
 
 out_requeue:
-	queue_delayed_work(system_unbound_wq, &zram->adapt_work, ZRAM_ADAPT_PERIOD);
+	queue_delayed_work(system_unbound_wq, &zram->adapt_work, delay);
 }
 #endif
 
@@ -2967,7 +2989,7 @@ static int zram_set_disksize(struct zram *zram, u64 disksize)
 	zram->disksize = disksize;
 	set_capacity_and_notify(zram->disk, zram->disksize >> SECTOR_SHIFT);
 #ifdef CONFIG_ZRAM_MULTI_COMP
-	schedule_delayed_work(&zram->adapt_work, ZRAM_ADAPT_PERIOD);
+	schedule_delayed_work(&zram->adapt_work, ZRAM_ADAPT_PERIOD_IDLE);
 #endif
 	return 0;
 
@@ -3086,7 +3108,7 @@ static ssize_t reset_store(struct device *dev,
 		 * ของมันเอง เลย re-arm worker เองตรงนี้ กัน adapt_work ค้าง
 		 * ตายถาวรจนกว่าจะมี reset ครั้งถัดไป (worker จะ no-op ทุก tick
 		 * เพราะ init_done() ยังเป็น false อยู่ ต้นทุนแทบเป็นศูนย์) */
-		schedule_delayed_work(&zram->adapt_work, ZRAM_ADAPT_PERIOD);
+		schedule_delayed_work(&zram->adapt_work, ZRAM_ADAPT_PERIOD_IDLE);
 #endif
 	}
 	up_write(&zram->dev_lock);
