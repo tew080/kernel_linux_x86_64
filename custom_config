@@ -42,7 +42,7 @@ CONFIG_THREAD_INFO_IN_TASK=y
 CONFIG_INIT_ENV_ARG_LIMIT=32
 # CONFIG_COMPILE_TEST is not set
 # CONFIG_WERROR is not set
-CONFIG_LOCALVERSION="-hexzagon-71v16f"
+CONFIG_LOCALVERSION="-hexzagon-71v18f"
 # CONFIG_LOCALVERSION_AUTO is not set
 CONFIG_BUILD_SALT=""
 CONFIG_HAVE_KERNEL_GZIP=y
@@ -13416,6 +13416,7 @@ CONFIG_SCHED_PROXY_EXEC=n
 CONFIG_SCHED_ALT=y
 CONFIG_SCHED_BMQ=y
 CONFIG_SCHED_PDS=n
+CONFIG_SCHED_BMQ_BURST=y
 #################################################
 # x86-64 compiler ISA level
 #################################################
@@ -13427,11 +13428,11 @@ CONFIG_ACPI_CALL=y
 #################################################
 # Default secondary zram compressor (auto density-based recompress)
 #################################################
-CONFIG_ZRAM_DEF_COMP_SECONDARY="zstd"
+CONFIG_ZRAM_DEF_COMP_SECONDARY="lz4hc"
 #################################################
 # Default secondary zram compressor level
 #################################################
-CONFIG_ZRAM_DEF_COMP_SECONDARY_LEVEL=3
+CONFIG_ZRAM_DEF_COMP_SECONDARY_LEVEL=4
 #################################################
 # AutoFDO profile
 #################################################
