@@ -2538,7 +2538,7 @@ bool compaction_suitable(struct zone *zone, int order, unsigned long watermark,
 			int fragindex = fragmentation_index(zone, order);
 
 			if (fragindex >= 0 &&
-			    fragindex <= sysctl_extfrag_threshold) {
+			    fragindex <= READ_ONCE(compaction_eff_extfrag)) {
 				suitable = false;
 				compact_result = COMPACT_NOT_SUITABLE_ZONE;
 			}
