@@ -54,13 +54,9 @@
 #include <trace/events/oom.h>
 
 static int sysctl_panic_on_oom;
-#ifdef CONFIG_TWEAKS
-static int sysctl_oom_kill_allocating_task = 1;
-static int sysctl_oom_dump_tasks = 0;
-#else
 static int sysctl_oom_kill_allocating_task;
 static int sysctl_oom_dump_tasks = 1;
-#endif
+
 /*
  * Serializes oom killer invocations (out_of_memory()) from all contexts to
  * prevent from over eager oom killing (e.g. when the oom killer is invoked
