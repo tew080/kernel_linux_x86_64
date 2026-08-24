@@ -665,7 +665,7 @@ static inline void __dequeue_task(struct task_struct *p, struct rq *rq)
 
 #ifdef CONFIG_SCHED_BMQ_BURST
 #define BMQ_BURST_FP                8
-#define BMQ_BURST_PENALTY_OFFSET    24
+#define BMQ_BURST_PENALTY_OFFSET    34
 #define BMQ_BURST_PENALTY_SCALE     1536
 #define BMQ_BURST_PENALTY_MAX       MAX_PRIORITY_ADJ
 
