@@ -297,6 +297,20 @@ static int sc_swappiness(struct scan_control *sc, struct mem_cgroup *memcg)
 	int swappiness = sc_swappiness_base(sc, memcg);
 	int boost;
 
+	/*
+	 * page_cluster (swap readahead) ควร "หด" ตามความรุนแรงของแรงกดดัน
+	 * เดียวกับที่ swappiness ใช้ — ยิ่งกดดันหนัก ยิ่งไม่ควรอ่านเผื่อ
+	 * (ถอดรหัส zram) เกินจำเป็น ไม่ต้องเช็คเงื่อนไขพิเศษเหมือน swappiness
+	 * ข้างล่าง เพราะเป็นคนละกลไก (ไม่เกี่ยวกับ 0/ANON_ONLY) — เรียกก่อน
+	 * บรรทัด return พิเศษด้านล่างเสมอ
+	 */
+	if (sc->priority <= DEF_PRIORITY / 4)
+		swap_cluster_adjust(2);
+	else if (sc->priority < DEF_PRIORITY)
+		swap_cluster_adjust(1);
+	else
+		swap_cluster_adjust(0);
+
 	if (swappiness <= 0 || swappiness == SWAPPINESS_ANON_ONLY)
 		return swappiness;
 

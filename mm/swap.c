@@ -1185,13 +1185,11 @@ void swap_cluster_adjust(int pressure_level)
 	if (unlikely(pressure_level < 0 || pressure_level > 2))
 		return;
 
+	if (likely(atomic_read(&page_cluster_active_level) == pressure_level))
+		return;
+
 	spin_lock_irqsave(&swap_cluster_lock, flags);
 
-	/*
-	 * ตอนนี้ "อ่านสถานะ active" กับ "ตัดสินใจ throttle/เขียนทับ" อยู่ใน
-	 * critical section เดียวกัน — ไม่มีทางให้สัญญาณเบากว่ามาแทรกกลาง
-	 * แล้วเขียนทับสัญญาณวิกฤตที่เพิ่งตั้งไปหมาดๆ ได้อีกต่อไป
-	 */
 	if (pressure_level < atomic_read(&page_cluster_active_level)) {
 		unsigned long now = jiffies;
 
@@ -1207,7 +1205,7 @@ void swap_cluster_adjust(int pressure_level)
 
 	switch (pressure_level) {
 	case 2:
-		new_cluster = 0;
+		new_cluster = 1;
 		break;
 	case 1:
 		new_cluster = max(page_cluster_baseline - 2, 1);

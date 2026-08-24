@@ -118,6 +118,8 @@ void page_writeback_init(void);
  */
 #define SHOW_MEM_FILTER_NODES		(0x0001u)	/* disallowed nodes */
 
+void swap_cluster_adjust(int pressure_level);
+
 /*
  * How many individual pages have an elevated _mapcount.  Excludes
  * the folio's entire_mapcount.
