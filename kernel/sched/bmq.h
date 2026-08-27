@@ -90,18 +90,22 @@ static inline void do_sched_yield_type_1(struct task_struct *p, struct rq *rq)
 
 static inline void sched_task_ttwu(struct task_struct *p)
 {
-	s64 delta = this_rq()->clock_task - p->last_ran;
+	s64 sleep_ns = this_rq()->clock_task - p->last_ran;
 	int boost = 0;
 
-	if (likely(delta > 0))
-		boost_task(p, delta  >> 22);
+	if (likely(sleep_ns > 0))
+		boost = (int)(sleep_ns >> 22);
 
 #ifdef CONFIG_SCHED_BMQ_BURST
-    if (boost > 0)
-        boost = max(boost - (int)p->prev_burst_penalty, 0);
+	if (boost > 0) {
+		int penalty = p->prev_burst_penalty;
+
+		boost = max(boost - penalty, 0);
+	}
 #endif
+
 	if (boost > 0)
-         boost_task(p, boost);
+		boost_task(p, boost);
 }
 
 static inline void sched_task_deactivate(struct task_struct *p, struct rq *rq)
