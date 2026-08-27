@@ -4556,11 +4556,38 @@ static inline void prio_balance(struct rq *rq, const int cpu)
 	cpumask_copy(&mask, cpu_active_mask);
 	cpumask_clear_cpu(cpu, &mask);
 
+	/*
+	 * Keep periodic push balancing inside the local LLC/coregroup.
+	 *
+	 * Cross-LLC movement is still handled by idle pull through
+	 * take_other_rq_tasks(), which follows the scheduler topology.
+	 * This avoids unnecessary cache-domain bouncing during normal
+	 * push balancing.
+	 */
+	if (likely(per_cpu(sched_cpu_llc_mask, cpu))) {
+		cpumask_and(&mask, &mask,
+			    per_cpu(sched_cpu_llc_mask, cpu));
+		if (cpumask_empty(&mask))
+			return;
+	}
+
 	p = sched_rq_next_task(rq->curr, rq);
 	while (p != rq->idle) {
 		next = sched_rq_next_task(p, rq);
 		if (!is_migration_disabled(p)) {
 			int dest_cpu;
+
+			/*
+			 * Keep tasks that still carry their wake boost out of
+			 * periodic push balancing.  They have not yet incurred
+			 * BMQ's normal deboost, so preserving locality is
+			 * preferable to proactive migration here.
+			 *
+			 * Once boost_prio has been deboosted, normal LLC-local
+			 * push balancing becomes available again.
+			 */
+			if (p->boost_prio == 0)
+				goto next_task;
 
 			dest_cpu = balance_select_task_rq(p, &mask);
 			if (dest_cpu < 0)
@@ -4582,6 +4609,7 @@ static inline void prio_balance(struct rq *rq, const int cpu)
 				}
 			}
 		}
+next_task:
 		p = next;
 	}
 }
