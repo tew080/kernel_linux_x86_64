@@ -2705,10 +2705,8 @@ static void zram_adapt_work_fn(struct work_struct *w)
 
 	if (!init_done(zram)) {
 		up_read(&zram->dev_lock);
-		/* อุปกรณ์ถูก reset/ยังไม่ตั้ง disksize — ไม่ต้อง requeue ต่อ
-		 * (cancel_delayed_work_sync ใน zram_reset_device จะจัดการ
-		 * ยกเลิกให้แน่นอนอยู่แล้ว บรรทัดนี้กันไว้อีกชั้นเฉยๆ) */
-		return;
+		goto out_requeue;
+		
 	}
 	up_read(&zram->dev_lock);
 
