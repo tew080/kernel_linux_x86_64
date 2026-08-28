@@ -6524,6 +6524,8 @@ static void setup_per_zone_lowmem_reserve(void)
 	calculate_totalreserve_pages();
 }
 
+static unsigned long watermark_scale_last_totalram;
+
 static void __setup_per_zone_wmarks(void)
 {
 	unsigned long pages_min = min_free_kbytes >> (PAGE_SHIFT - 10);
@@ -6531,13 +6533,10 @@ static void __setup_per_zone_wmarks(void)
 	struct zone *zone;
 	unsigned long flags;
 
-	/*
-	 * คำนวณ tier ใหม่ทุกครั้งที่ฟังก์ชันนี้ถูกเรียก — idempotent
-	 * และถูกที่สุดพอดี เพราะ trigger ของฟังก์ชันนี้ (boot/min_free_kbytes
-	 * เปลี่ยน/hotplug) คือจังหวะเดียวกับที่ "RAM ทั้งเครื่อง" อาจเปลี่ยน
-	 * ไปพอดี (โดยเฉพาะ hotplug) ไม่ต้อง cache แยกเพิ่ม
-	 */
-	WRITE_ONCE(watermark_scale_factor, watermark_compute_scale_factor());
+	if (totalram_pages() != watermark_scale_last_totalram) {
+		watermark_scale_last_totalram = totalram_pages();
+		WRITE_ONCE(watermark_scale_factor, watermark_compute_scale_factor());
+	}
 
 	/* Calculate total number of !ZONE_HIGHMEM and !ZONE_MOVABLE pages */
 	for_each_zone(zone) {
