@@ -34,6 +34,7 @@
 #include <linux/part_stat.h>
 #include <linux/kernel_read_file.h>
 #include <linux/rcupdate.h>
+#include <linux/sched/loadavg.h>
 
 #include "zram_drv.h"
 
@@ -2650,7 +2651,7 @@ static void zram_run_recompress_pass(struct zram *zram, u32 mode, u32 prio,
 	if (!zram->comps[prio])
 		return;
 
-	page = alloc_page(GFP_NOIO);
+	page = alloc_page(GFP_NOIO | __GFP_NORETRY);
 	if (!page)
 		return;
 
@@ -2713,6 +2714,13 @@ static void zram_adapt_work_fn(struct work_struct *w)
 
 	level = zram_mem_density_level();
 	if (level == ZRAM_DENSITY_NORMAL)
+		goto out_requeue;
+
+	/* CPU ตึงอยู่แล้ว (เช่น ffmpeg/AI-encode แข่งอยู่) อย่าไปเพิ่ม
+	 * recompress ซ้อนเข้าไปอีก รอ CPU ว่างก่อน — background optimization
+	 * เลื่อนได้ ไม่เหมือน foreground app ที่รอไม่ได้ 
+	*/
+	if ((avenrun[0] >> FSHIFT) >= num_online_cpus())
 		goto out_requeue;
 
 	if (level == ZRAM_DENSITY_TIGHT) {
