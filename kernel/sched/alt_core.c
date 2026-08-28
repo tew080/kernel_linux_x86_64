@@ -4586,7 +4586,7 @@ static inline void prio_balance(struct rq *rq, const int cpu)
 			 * Once boost_prio has been deboosted, normal LLC-local
 			 * push balancing becomes available again.
 			 */
-			if (p->boost_prio == 0)
+			if (p->boost_prio < 0)
 				goto next_task;
 
 			dest_cpu = balance_select_task_rq(p, &mask);
