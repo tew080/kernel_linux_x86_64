@@ -1428,13 +1428,13 @@ void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
 		local_irq_enable();
 	}
 
-	put_cpu();
-
 	if (remote_flush) {
 		info.trim_cpumask = should_trim_cpumask(mm);
 		flush_tlb_multi(mm_cpumask(mm), &info);
 		consider_global_asid(mm);
 	}
+
+	put_cpu();
 
 	mmu_notifier_arch_invalidate_secondary_tlbs(mm, start, end);
 }
@@ -1704,10 +1704,10 @@ void arch_tlbbatch_flush(struct arch_tlbflush_unmap_batch *batch)
 		local_irq_enable();
 	}
 
-	put_cpu();
-
 	if (remote_flush)
 		flush_tlb_multi(&batch->cpumask, &info);
+
+	put_cpu();
 
 	cpumask_clear(&batch->cpumask);
 }
