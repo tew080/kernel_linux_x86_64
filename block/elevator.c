@@ -741,7 +741,7 @@ void elevator_set_default(struct request_queue *q)
 		return;
 
 #ifdef CONFIG_MQ_IOSCHED_KYBER
-		ctx.name = "kyber",
+		ctx.name = "kyber";
 #endif
 
 	/*
