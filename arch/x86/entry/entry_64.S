@@ -1535,9 +1535,9 @@ SYM_CODE_END(rewind_stack_and_make_dead)
 SYM_FUNC_START(clear_bhb_loop_nofence)
 	ANNOTATE_NOENDBR
 	push	%rbp
+	mov	%rsp, %rbp
 	/* BPF caller may require %rax to be preserved */
 	push	%rax
-	mov	%rsp, %rbp
 
 	/*
 	 * Between the long and short version of BHB clear sequence, just the
