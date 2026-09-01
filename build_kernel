@@ -18,6 +18,9 @@
 #patch -p1 < patch/
 #patch -p1 -R < patch/
 #git diff $(git rev-list --max-parents=0 HEAD) HEAD > all_changes.diff
+#git diff $(git rev-list --max-parents=0 HEAD) HEAD -- \
+#  arch/ block/ drivers/ fs/ include/ init/ kernel/ lib/ mm/ Makefile \
+#  > scoped.diff
 
 # AutoFDO Profile
 # 0
@@ -241,8 +244,6 @@ if [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" && "$PROPELLER" == 
     export HOSTAR=$tool/bin/llvm-ar
     export HOSTLD=$tool/bin/ld.lld
     export KCFLAGS="-fbasic-block-address-map"
-    export CC_PROFILE="kernel_prop_cc_profile.txt"
-    export LD_PROFILE="kernel_prop_ld_profile.txt"
     export PROP_PREFIX="kernel_prop"
 
     $CFG --enable AUTOFDO_CLANG
@@ -256,8 +257,6 @@ if [[ "$COMPILER" == "clang" && "$PROFILE" == "user_profile" && "$PROPELLER" == 
     $CFG --disable DEBUG_FS
     $CFG --disable FRAME_POINTER
 
-    $CFG --disable FTRACE
-    $CFG --disable TRACING
     $CFG --disable PAGE_POISONING
     $CFG --disable KFENCE
     $CFG --disable SCHEDSTATS
@@ -293,7 +292,7 @@ elif [[ "$COMPILER" == "clang" ]]; then
     $CFG --enable AUTOFDO_CLANG
     $CFG --disable AUTOFDO_CLANG_STEPTWO
     $CFG --enable PROPELLER_CLANG       
-    $CFG --enable DEBUG_INFO            
+    $CFG --enable DEBUG_INFO         
     $CFG --enable PERF_EVENTS
     $CFG --enable DEBUG_FS
     $CFG --enable FRAME_POINTER
